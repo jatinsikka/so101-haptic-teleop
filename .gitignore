@@ -3,3 +3,4 @@ install/
 log/
 camera_snapshots/
 .solution/
+.venv/
