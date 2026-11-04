@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>so101_teleop</name>
+  <version>0.1.0</version>
+  <description>SO-101 leader/follower teleop with force feedback, wrist camera and Hapkit gripper (ME384R)</description>
+  <maintainer email="jsikka@utexas.edu">Jatin Sikka</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <!-- pip, not rosdep, on Windows: feetech-servo-sdk pyserial opencv-python numpy -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
