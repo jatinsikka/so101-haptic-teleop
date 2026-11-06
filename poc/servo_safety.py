@@ -15,12 +15,24 @@ TORQUE_ENABLE_ADDR = 40
 # Instruction codes from scservo_sdk/scservo_def.py.
 INST_PING = 1
 INST_READ = 2
+INST_WRITE = 3
 READ_ONLY_INSTRUCTIONS = frozenset({INST_PING, INST_READ})
 
 # Packet layout: FF FF <id> <length> <instruction> <params...> <checksum>
 _PKT_ID = 2
+_PKT_LENGTH = 3
 _PKT_INSTRUCTION = 4
+_PKT_PARAMS = 5
 _MIN_PACKET_LENGTH = 6
+
+# Registers 40, 42 and 48 are listed as SRAM by Feetech's SMS_STS.h and by LeRobot v0.6.1 tables.py.
+GOAL_POSITION_ADDR = 42
+TORQUE_LIMIT_ADDR = 48
+
+# Values read from this gripper's registers 9, 11 and 16.
+MIN_GOAL_TICK = 2035
+MAX_GOAL_TICK = 3463
+MAX_TORQUE_LIMIT = 500
 
 
 class WriteBlockedError(RuntimeError):
@@ -36,6 +48,28 @@ def check_torque_enable_value(value):
     return value
 
 
+def check_goal_position(value):
+    if not MIN_GOAL_TICK <= value <= MAX_GOAL_TICK:
+        raise WriteBlockedError(
+            f"goal {value} is outside {MIN_GOAL_TICK}-{MAX_GOAL_TICK}"
+        )
+    return value
+
+
+def check_torque_limit(value):
+    if not 0 <= value <= MAX_TORQUE_LIMIT:
+        raise WriteBlockedError(f"torque limit {value} is outside 0-{MAX_TORQUE_LIMIT}")
+    return value
+
+
+# register: (size in bytes, value check)
+_ALLOWED_WRITES = {
+    TORQUE_ENABLE_ADDR: (1, check_torque_enable_value),
+    GOAL_POSITION_ADDR: (2, check_goal_position),
+    TORQUE_LIMIT_ADDR: (2, check_torque_limit),
+}
+
+
 class ReadOnlyPortHandler(PortHandler):
     """A PortHandler that only transmits PING and READ packets addressed to one servo."""
 
@@ -44,6 +78,16 @@ class ReadOnlyPortHandler(PortHandler):
         self.allowed_id = allowed_id
 
     def writePort(self, packet):
+        try:
+            self._check_packet(packet)
+        except WriteBlockedError:
+            # The SDK sets is_using before calling here and clears it only after a reply. Left set,
+            # every later packet fails as "port busy", including the torque-off write on exit.
+            self.is_using = False
+            raise
+        return super().writePort(packet)
+
+    def _check_packet(self, packet):
         if len(packet) < _MIN_PACKET_LENGTH or packet[0] != 0xFF or packet[1] != 0xFF:
             raise WriteBlockedError(f"malformed packet blocked: {list(packet)}")
         if packet[_PKT_ID] != self.allowed_id:
@@ -54,4 +98,31 @@ class ReadOnlyPortHandler(PortHandler):
             raise WriteBlockedError(
                 f"instruction {packet[_PKT_INSTRUCTION]} blocked; this port is read-only"
             )
-        return super().writePort(packet)
+
+
+class GripperPortHandler(ReadOnlyPortHandler):
+    """Adds the three writes the gripper loop needs. Every other write stays blocked.
+
+    Registers 0-39 (EEPROM) and 55 (Lock) can never be written through this port. Each write must
+    use the register's exact size, so a longer write cannot spill into a neighbouring register.
+    """
+
+    def _check_packet(self, packet):
+        if len(packet) < _MIN_PACKET_LENGTH or packet[_PKT_INSTRUCTION] != INST_WRITE:
+            super()._check_packet(packet)
+            return
+
+        if packet[0] != 0xFF or packet[1] != 0xFF or packet[_PKT_ID] != self.allowed_id:
+            raise WriteBlockedError(f"write blocked, bad header or ID: {list(packet)}")
+        if len(packet) != packet[_PKT_LENGTH] + 4:
+            raise WriteBlockedError(f"write blocked, inconsistent length: {list(packet)}")
+
+        addr = packet[_PKT_PARAMS]
+        data = list(packet[_PKT_PARAMS + 1:-1])
+        rule = _ALLOWED_WRITES.get(addr)
+        if rule is None:
+            raise WriteBlockedError(f"write to register {addr} blocked")
+        size, check = rule
+        if len(data) != size:
+            raise WriteBlockedError(f"register {addr} needs {size} bytes, got {len(data)}")
+        check(sum(byte << (8 * i) for i, byte in enumerate(data)))

@@ -28,6 +28,11 @@ STARTUP_TIMEOUT_S = 5.0  # the Uno bootloader takes a couple of seconds after a 
 POLL_SLEEP_S = 0.001
 MAX_LINE_BYTES = 64  # far longer than any valid line
 
+# The live stream sends about 90 bytes per 50 ms window; a backlog arrives far faster than that.
+DRAIN_WINDOW_S = 0.05
+DRAIN_LIVE_BYTES = 300
+DRAIN_TIMEOUT_S = 5.0
+
 BOOT_LINE = b"# hapkit_gripper"
 SAMPLE_LINE = re.compile(rb"P (-?\d+(?:\.\d+)?)")
 
@@ -69,6 +74,28 @@ class HapkitReader:
             self._count_junk()
             self.buffer.clear()
         return samples
+
+    def discard_pending(self, clock=time.perf_counter, sleep=time.sleep):
+        """Drop old data after a pause, such as a prompt. Returns False if it never caught up.
+
+        This reads the backlog rather than calling reset_input_buffer(): on this Mac, resetting a
+        full input buffer left the stream silent for at least 2 s. The backlog is gone once a
+        window holds no more than live-rate traffic. The next partial line is not an error.
+        """
+        start = clock()
+        caught_up = False
+        while not caught_up and clock() - start < DRAIN_TIMEOUT_S:
+            window_start = clock()
+            received = 0
+            while clock() - window_start < DRAIN_WINDOW_S:
+                waiting = self.ser.in_waiting
+                if waiting:
+                    received += len(self.ser.read(waiting))
+                sleep(POLL_SLEEP_S)
+            caught_up = received <= DRAIN_LIVE_BYTES
+        self.buffer.clear()
+        self.synced = False
+        return caught_up
 
     def _parse(self, line):
         if line.startswith(BOOT_LINE):

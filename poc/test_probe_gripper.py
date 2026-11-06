@@ -111,6 +111,12 @@ class ReadOnlyGuardTests(unittest.TestCase):
         self.assert_blocked(lambda: self.port.writePort([0xFF, 0xFF, SERVO_ID]))
         self.assert_blocked(lambda: self.port.writePort([0, 0, SERVO_ID, 2, INST_READ, 0]))
 
+    def test_port_still_works_after_a_blocked_packet(self):
+        self.assert_blocked(lambda: self.bus.write1ByteTxRx(self.port, SERVO_ID, 40, 0))
+        self.servo.memory[63] = 31
+        value, _comm, _error = self.bus.read1ByteTxRx(self.port, SERVO_ID, 63)
+        self.assertEqual(value, 31)
+
     def test_allows_read(self):
         self.servo.memory[63] = 31
         value, _comm, _error = self.bus.read1ByteTxRx(self.port, SERVO_ID, 63)
