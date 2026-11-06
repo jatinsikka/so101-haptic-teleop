@@ -230,6 +230,57 @@ class NextGoalTests(unittest.TestCase):
         self.assertEqual(gt.next_goal(3463, 3463, 3472, 0, 12), 3463)
 
 
+class TargetPredictorTests(unittest.TestCase):
+    def predictor(self, ahead_s=0.05):
+        return gt.TargetPredictor(ahead_s, 0.01)
+
+    def test_first_update_and_rest_add_nothing(self):
+        predictor = self.predictor()
+        for _ in range(5):
+            self.assertEqual(predictor.update(2500), 2500)
+
+    def test_steady_motion_aims_ahead_by_velocity_times_time(self):
+        predictor = self.predictor()
+        target = 2100
+        for _ in range(100):
+            target += 10  # 1000 ticks/s
+            aim = predictor.update(target)
+        self.assertEqual(aim, target + 50)
+
+    def test_aims_ahead_when_closing_too(self):
+        predictor = self.predictor()
+        target = 3400
+        for _ in range(100):
+            target -= 10
+            aim = predictor.update(target)
+        self.assertEqual(aim, target - 50)
+
+    def test_aim_stays_within_gripper_range(self):
+        predictor = self.predictor()
+        for target in range(3300, gt.OPEN_TICK + 1, 20):
+            self.assertLessEqual(predictor.update(target), gt.OPEN_TICK)
+        predictor = self.predictor()
+        for target in range(2300, gt.CLOSED_TICK - 1, -20):
+            self.assertGreaterEqual(predictor.update(target), gt.CLOSED_TICK)
+
+    def test_single_encoder_count_causes_only_small_jitter(self):
+        predictor = self.predictor()
+        predictor.update(2500)
+        self.assertLessEqual(abs(predictor.update(2508) - 2508), 10)
+
+    def test_zero_ahead_disables_it(self):
+        predictor = self.predictor(0.0)
+        predictor.update(2500)
+        self.assertEqual(predictor.update(2600), 2600)
+
+    def test_reset_clears_velocity(self):
+        predictor = self.predictor()
+        predictor.update(2500)
+        predictor.update(2600)
+        predictor.reset()
+        self.assertEqual(predictor.update(2700), 2700)
+
+
 class HoldTests(unittest.TestCase):
     def test_follows_in_range_with_fresh_data(self):
         self.assertIsNone(gt.hold_reason(0.0, -7.34, 0.01))
@@ -362,8 +413,8 @@ class ControlLoopTests(unittest.TestCase):
     def test_starts_at_closed_and_moves_at_the_rate_limit(self):
         self.assertEqual(self.run_loop(duration=0.2), gt.EXIT_OK)
         goals = self.goals()
-        self.assertEqual(goals[0], 2488)
-        self.assertTrue(all(abs(b - a) <= 12 for a, b in zip([2500] + goals, goals)))
+        self.assertEqual(goals[0], 2494)
+        self.assertTrue(all(abs(b - a) <= 6 for a, b in zip([2500] + goals, goals)))
 
     def test_reaches_closed_with_handle_at_left_stop(self):
         self.run_loop(duration=2.0)

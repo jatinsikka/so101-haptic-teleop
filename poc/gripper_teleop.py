@@ -52,8 +52,8 @@ CLOSED_TICK = 2040
 OPEN_TICK = MAX_GOAL_TICK - 20
 
 # Control
-RATE_HZ = 50.0
-DEFAULT_TORQUE_LIMIT = 400   # sets speed; grip force is bounded by the stall lead below
+RATE_HZ = 100.0
+DEFAULT_TORQUE_LIMIT = 500   # sets speed; grip force is bounded by the stall lead below
 DEFAULT_RATE_LIMIT = 3000    # ticks/s
 MAX_RATE_LIMIT = 3000        # ticks/s
 
@@ -64,12 +64,17 @@ STALL_LEAD_TICKS = 50
 LEAD_PER_SPEED = 0.3         # extra ticks of lead per tick/s of measured speed
 MAX_LEAD_TICKS = 300
 
+# The servo trails its goal by about 70 ms, so aim ahead of the handle by part of that. The handle
+# moves in whole encoder counts, so its velocity needs filtering to avoid jitter at low speed.
+DEFAULT_FEEDFORWARD_MS = 50
+FEEDFORWARD_FILTER_S = 0.04
+
 # Safety
 HANDLE_STALE_S = 0.25
 HANDLE_RANGE_MARGIN_CM = 1.0
-MAX_CONSECUTIVE_BUS_FAILURES = 25  # 0.5 s at 50 Hz
+MAX_CONSECUTIVE_BUS_FAILURES = 50  # 0.5 s at 100 Hz
 MAX_TEMPERATURE_C = 55
-OVERTEMP_READINGS = 5  # single readings can glitch, so require several in a row
+OVERTEMP_READINGS = 10  # 0.1 s at 100 Hz; single readings can glitch, so require several in a row
 WRITE_ATTEMPTS = 3
 
 # Zeroing
@@ -115,6 +120,30 @@ def next_goal(target, previous_goal, position, speed, max_step):
     lead = allowed_lead(speed)
     goal = clamp(goal, position - lead, position + lead)
     return clamp(goal, MIN_GOAL_TICK, MAX_GOAL_TICK)
+
+
+class TargetPredictor:
+    """Aims ahead of a moving target by its filtered velocity, to offset the servo's lag.
+
+    It works on the mapped target, so velocity is zero inside the closed zone.
+    """
+
+    def __init__(self, ahead_s, period_s):
+        self.ahead_s = ahead_s
+        self.period_s = period_s
+        self.alpha = period_s / (FEEDFORWARD_FILTER_S + period_s)
+        self.reset()
+
+    def reset(self):
+        self.previous = None
+        self.velocity = 0.0
+
+    def update(self, target):
+        if self.previous is not None:
+            raw = (target - self.previous) / self.period_s
+            self.velocity += self.alpha * (raw - self.velocity)
+        self.previous = target
+        return clamp(round(target + self.velocity * self.ahead_s), CLOSED_TICK, OPEN_TICK)
 
 
 def hold_reason(xh, xh_closed, sample_age):
@@ -237,10 +266,11 @@ def disengage(gripper, original_limit, out):
 
 
 def control_loop(gripper, reader, xh_closed, goal, rate_limit, duration, out, log=None,
-                 clock=time.perf_counter, sleep=time.sleep):
-    """Run the 50 Hz loop until duration, Ctrl+C or a safety stop. Returns an exit status."""
+                 clock=time.perf_counter, sleep=time.sleep, feedforward_s=0.0):
+    """Run the control loop until duration, Ctrl+C or a safety stop. Returns an exit status."""
     period = 1.0 / RATE_HZ
     max_step = max(1, round(rate_limit * period))
+    predictor = TargetPredictor(feedforward_s, period)
     start = clock()
     next_tick = start
     next_print = start
@@ -295,9 +325,11 @@ def control_loop(gripper, reader, xh_closed, goal, rate_limit, duration, out, lo
                     out(f"HOLD: {hold}" if hold else "resumed following the handle")
                     last_hold = hold
                 if hold:
+                    predictor.reset()
                     goal = clamp(position, MIN_GOAL_TICK, MAX_GOAL_TICK)
                 else:
-                    goal = next_goal(target, goal, position, sample["speed"], max_step)
+                    aim = predictor.update(target)
+                    goal = next_goal(aim, goal, position, sample["speed"], max_step)
                 written = gripper.write(GOAL_POSITION_ADDR, 2, goal)
 
                 load = sample["load"]
@@ -399,13 +431,15 @@ def run(args, log, out=print, wait_for_enter=input):
                     raise ServoError("could not read the gripper position")
                 goal = clamp(sample["position"], MIN_GOAL_TICK, MAX_GOAL_TICK)
                 return control_loop(gripper, reader, xh_closed, goal, args.rate_limit,
-                                    args.duration, out, log)
+                                    args.duration, out, log,
+                                    feedforward_s=args.feedforward_ms / 1000.0)
 
             out("Gripper will close now, then follow the handle. Keep fingers clear. Ctrl+C stops.")
             try:
                 goal = engage(gripper, args.torque_limit)
                 return control_loop(gripper, reader, xh_closed, goal, args.rate_limit,
-                                    args.duration, out, log)
+                                    args.duration, out, log,
+                                    feedforward_s=args.feedforward_ms / 1000.0)
             finally:
                 disengage(gripper, original_limit, out)
         except (ServoError, WriteBlockedError) as exc:
@@ -443,6 +477,9 @@ def main(argv=None):
                              f"{DEFAULT_TORQUE_LIMIT})")
     parser.add_argument("--rate-limit", type=positive_rate_limit, default=DEFAULT_RATE_LIMIT,
                         help=f"ticks/s, up to {MAX_RATE_LIMIT} (default {DEFAULT_RATE_LIMIT})")
+    parser.add_argument("--feedforward-ms", type=float, default=DEFAULT_FEEDFORWARD_MS,
+                        help=f"aim this far ahead of the handle, 0 to disable (default "
+                             f"{DEFAULT_FEEDFORWARD_MS})")
     parser.add_argument("--duration", type=float, default=None,
                         help="seconds to run (default: until Ctrl+C)")
     parser.add_argument("--log", default=None, help="write every tick to this CSV file")
