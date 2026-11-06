@@ -89,6 +89,17 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(reader.bad_lines, 0)
         self.assertEqual(reader.boot_lines, 1)
 
+    def test_records_firmware_version(self):
+        reader, _ = read_all(b"# hapkit_gripper m4\r\nP 0.00\r\n")
+        self.assertEqual(reader.firmware, b"# hapkit_gripper m4")
+
+    def test_status_lines_are_not_errors(self):
+        reader, samples = read_all(b"P 0.00\r\n# isr_max_us 88\r\n# something else\r\nP 1.00\r\n")
+        self.assertEqual(samples, [0.0, 1.0])
+        self.assertEqual(reader.isr_max_us, 88)
+        self.assertEqual(reader.bad_lines, 0)
+        self.assertEqual(reader.boot_lines, 0)
+
     def test_old_firmware_output_never_syncs(self):
         reader, samples = read_all(b"|xh: 1.00 |vh: |0.00 |PWM: 0.00 |xm: 0.50 |vm: 0.00\r\n")
         self.assertEqual(samples, [])

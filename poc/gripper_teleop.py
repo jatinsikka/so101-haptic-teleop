@@ -22,12 +22,16 @@ import csv
 import signal
 import statistics
 import sys
+import termios
 import time
+import tty
 
 import serial
 from scservo_sdk import COMM_SUCCESS, PacketHandler
 from serial.tools import list_ports
 
+from contact_wall import (MAX_WALL_K, SURFACE_AMP_PER_CM_S, SURFACE_BASE_AMP, SURFACE_DECAY_S,
+                          SURFACE_FREQ_HZ, SURFACE_MAX_AMP, WALL_LANDING_SPEED_CM_S, WALL_SPRING, WALL_SURFACE, ContactWall)
 from probe_gripper import (EXPECTED_MODEL, SERVO_ID, TELEMETRY_ADDR, TELEMETRY_LENGTH,
                            decode_telemetry, describe_status, little_endian, read_bytes)
 from read_hapkit import BAUD as HAPKIT_BAUD
@@ -50,6 +54,7 @@ CLOSE_THRESHOLD_FRACTION = 0.20  # share of handle travel, from the left stop, t
 CLOSE_THRESHOLD_CM = CLOSE_THRESHOLD_FRACTION * HANDLE_SPAN_CM
 CLOSED_TICK = 2040
 OPEN_TICK = MAX_GOAL_TICK - 20
+TICKS_PER_HANDLE_CM = (OPEN_TICK - CLOSED_TICK) / (HANDLE_SPAN_CM - CLOSE_THRESHOLD_CM)
 
 # Control
 RATE_HZ = 100.0
@@ -66,8 +71,12 @@ MAX_LEAD_TICKS = 300
 
 # The servo trails its goal by about 70 ms, so aim ahead of the handle by part of that. The handle
 # moves in whole encoder counts, so its velocity needs filtering to avoid jitter at low speed.
-DEFAULT_FEEDFORWARD_MS = 50
+DEFAULT_FEEDFORWARD_MS = 70
 FEEDFORWARD_FILTER_S = 0.04
+FEEDFORWARD_MIN_SPEED = 300  # ticks/s; below this, one encoder count would only make the goal wiggle
+
+# Wall stiffness in PWM per cm during contact. The firmware caps this at K_MAX_PWM_PER_CM.
+DEFAULT_WALL_K = 200.0
 
 # Safety
 HANDLE_STALE_S = 0.25
@@ -114,6 +123,12 @@ def allowed_lead(speed):
     return min(MAX_LEAD_TICKS, round(STALL_LEAD_TICKS + LEAD_PER_SPEED * abs(speed)))
 
 
+def ticks_to_handle(ticks, xh_closed):
+    """The handle position that maps to these gripper ticks; the inverse of handle_to_ticks."""
+    opening = clamp((ticks - CLOSED_TICK) / (OPEN_TICK - CLOSED_TICK), 0.0, 1.0)
+    return xh_closed + CLOSE_THRESHOLD_CM + opening * (HANDLE_SPAN_CM - CLOSE_THRESHOLD_CM)
+
+
 def next_goal(target, previous_goal, position, speed, max_step):
     """Move toward target by at most max_step, staying near the position and in servo limits."""
     goal = previous_goal + clamp(target - previous_goal, -max_step, max_step)
@@ -143,6 +158,8 @@ class TargetPredictor:
             raw = (target - self.previous) / self.period_s
             self.velocity += self.alpha * (raw - self.velocity)
         self.previous = target
+        if abs(self.velocity) < FEEDFORWARD_MIN_SPEED:
+            return target
         return clamp(round(target + self.velocity * self.ahead_s), CLOSED_TICK, OPEN_TICK)
 
 
@@ -253,20 +270,28 @@ def engage(gripper, torque_limit):
 
 
 def disengage(gripper, original_limit, out):
-    """Torque off, then restore the limit. Tries both even if the first fails."""
+    """Torque off, then restore the limit. Each write runs even if anything before it failed."""
+    messages = []
     try:
         gripper.set_torque(0)
-        out("torque off")
+        messages.append("torque off")
     except Exception as exc:
-        out(f"WARNING: could not confirm torque off ({exc}). Power-cycle the follower.")
+        messages.append(f"WARNING: could not confirm torque off ({exc}). Power-cycle the follower.")
     try:
         gripper.write_required(TORQUE_LIMIT_ADDR, 2, original_limit)
     except Exception as exc:
-        out(f"WARNING: could not restore the torque limit ({exc}). A power cycle resets it.")
+        messages.append(f"WARNING: could not restore the torque limit ({exc}). A power cycle resets "
+                        "it.")
+    # Report last: if stdout has gone away, such as a closed pipe, the writes above still happened.
+    try:
+        for message in messages:
+            out(message)
+    except OSError:
+        pass
 
 
 def control_loop(gripper, reader, xh_closed, goal, rate_limit, duration, out, log=None,
-                 clock=time.perf_counter, sleep=time.sleep, feedforward_s=0.0):
+                 clock=time.perf_counter, sleep=time.sleep, feedforward_s=0.0, wall=None):
     """Run the control loop until duration, Ctrl+C or a safety stop. Returns an exit status."""
     period = 1.0 / RATE_HZ
     max_step = max(1, round(rate_limit * period))
@@ -324,6 +349,20 @@ def control_loop(gripper, reader, xh_closed, goal, rate_limit, duration, out, lo
                 if hold != last_hold:
                     out(f"HOLD: {hold}" if hold else "resumed following the handle")
                     last_hold = hold
+                if wall:
+                    if hold:
+                        if wall.in_contact:
+                            wall.stop()
+                            out("wall off: holding")
+                    else:
+                        event = wall.update(now, latest_xh, position, goal, sample["speed"])
+                        if event == "contact":
+                            impact = (f", impact amplitude {wall.impact_amp:.0f}"
+                                      if wall.wall_type == WALL_SURFACE else "")
+                            out(f"CONTACT at {position} ticks: wall at {wall.x_c:+.2f} cm, handle at "
+                                f"{latest_xh:+.2f} cm{impact}")
+                        elif event == "released":
+                            out("released: wall off")
                 if hold:
                     predictor.reset()
                     goal = clamp(position, MIN_GOAL_TICK, MAX_GOAL_TICK)
@@ -338,7 +377,10 @@ def control_loop(gripper, reader, xh_closed, goal, rate_limit, duration, out, lo
                 temperatures.append(sample["temperature"])
                 if log:
                     log.writerow([f"{now - start:.3f}", latest_xh, target, goal, position, load,
-                                  sample["temperature"], sample["speed"], hold or ""])
+                                  sample["temperature"], sample["speed"], hold or "",
+                                  f"{wall.x_c:.2f}" if wall and wall.x_c is not None else "",
+                                  f"{wall.commanded_k:.1f}" if wall else "",
+                                  f"{wall.impact_amp:.0f}" if wall and wall.impact_amp else ""])
                 if now >= next_print:
                     next_print += PRINT_PERIOD_S
                     out(f"{now - start:5.1f}  {latest_xh:+6.2f}  {target:>6}  {goal:>6}  "
@@ -386,11 +428,43 @@ def positive_rate_limit(text):
     return value
 
 
+def wall_stiffness_value(text):
+    value = float(text)
+    if not 0 <= value <= MAX_WALL_K:
+        raise argparse.ArgumentTypeError(f"must be 0-{MAX_WALL_K:.0f}")
+    return value
+
+
 def torque_limit_value(text):
     value = int(text)
     if not 1 <= value <= MAX_TORQUE_LIMIT:
         raise argparse.ArgumentTypeError(f"must be 1-{MAX_TORQUE_LIMIT}")
     return value
+
+
+def read_key():
+    """Read one key press without needing Enter. Ctrl+C still works."""
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().strip()[:1]
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def choose_wall_type(out, read=read_key):
+    out("Wall type: press 1 for spring wall, 2 for decaying sinusoid hard surface")
+    while True:
+        key = read()
+        if key == "1":
+            out("  -> 1: spring wall")
+            return WALL_SPRING
+        if key == "2":
+            out("  -> 2: decaying sinusoid hard surface")
+            return WALL_SURFACE
 
 
 def run(args, log, out=print, wait_for_enter=input):
@@ -401,7 +475,7 @@ def run(args, log, out=print, wait_for_enter=input):
         try:
             if not port.setBaudRate(GRIPPER_BAUD):
                 raise serial.SerialException("could not set the baud rate")
-            hapkit = serial.Serial(args.hapkit_port, HAPKIT_BAUD, timeout=0)
+            hapkit = serial.Serial(args.hapkit_port, HAPKIT_BAUD, timeout=0, write_timeout=0.01)
         except serial.SerialException as exc:
             out(f"ERROR: cannot open port: {exc}")
             out("Available: " + ", ".join(sorted(p.device for p in list_ports.comports())))
@@ -420,6 +494,10 @@ def run(args, log, out=print, wait_for_enter=input):
             if not first_samples:
                 raise ServoError("no P lines from the Hapkit; is hapkit_gripper uploaded?")
 
+            wall_type = args.wall_type
+            if wall_type is None and args.wall_k > 0 and not args.dry_run:
+                wall_type = choose_wall_type(out)
+
             wait_for_enter("Hold the handle still at the LEFT stop (closed), then press Enter: ")
             xh_closed = zero_handle(reader)
             out(f"zeroed: left stop at xh = {xh_closed:+.2f} cm")
@@ -434,14 +512,31 @@ def run(args, log, out=print, wait_for_enter=input):
                                     args.duration, out, log,
                                     feedforward_s=args.feedforward_ms / 1000.0)
 
+            wall = None
+            if args.wall_k > 0:
+                if reader.firmware and b"m4.1" not in reader.firmware:
+                    raise ServoError(f"walls need the m4.1 firmware, but the Uno reports "
+                                     f"{reader.firmware.decode()!r}; use --wall-k 0 or upload it")
+                wall = ContactWall(hapkit, lambda ticks: ticks_to_handle(ticks, xh_closed),
+                                   args.wall_k, wall_type, TICKS_PER_HANDLE_CM,
+                                   args.surface_base, args.surface_gain,
+                                   args.wall_landing_speed, args.surface_max)
+                if wall_type == WALL_SURFACE:
+                    wall.configure_surface(args.surface_freq, args.surface_decay)
+
             out("Gripper will close now, then follow the handle. Keep fingers clear. Ctrl+C stops.")
             try:
                 goal = engage(gripper, args.torque_limit)
                 return control_loop(gripper, reader, xh_closed, goal, args.rate_limit,
                                     args.duration, out, log,
-                                    feedforward_s=args.feedforward_ms / 1000.0)
+                                    feedforward_s=args.feedforward_ms / 1000.0, wall=wall)
             finally:
+                if wall:
+                    wall.stop()
                 disengage(gripper, original_limit, out)
+                if reader.isr_max_us is not None:
+                    out(f"longest ISR time in the last report: {reader.isr_max_us} us "
+                        "(period is 1000 us)")
         except (ServoError, WriteBlockedError) as exc:
             out(f"ERROR: {exc}")
             return EXIT_BUS_ERROR
@@ -480,6 +575,25 @@ def main(argv=None):
     parser.add_argument("--feedforward-ms", type=float, default=DEFAULT_FEEDFORWARD_MS,
                         help=f"aim this far ahead of the handle, 0 to disable (default "
                              f"{DEFAULT_FEEDFORWARD_MS})")
+    parser.add_argument("--wall-k", type=wall_stiffness_value, default=DEFAULT_WALL_K,
+                        help=f"handle wall stiffness in PWM/cm during contact, 0 for no wall "
+                             f"(default {DEFAULT_WALL_K:.0f})")
+    parser.add_argument("--wall-landing-speed", type=float, default=WALL_LANDING_SPEED_CM_S,
+                        help=f"cm/s the wall moves to the contact point, 0 for at once (default "
+                             f"{WALL_LANDING_SPEED_CM_S:.0f})")
+    parser.add_argument("--wall-type", choices=(WALL_SPRING, WALL_SURFACE), default=None,
+                        help="skip the 1 or 2 prompt at startup")
+    parser.add_argument("--surface-freq", type=float, default=SURFACE_FREQ_HZ,
+                        help=f"hard surface frequency in Hz (default {SURFACE_FREQ_HZ:.0f})")
+    parser.add_argument("--surface-decay", type=float, default=SURFACE_DECAY_S,
+                        help=f"hard surface time to decay to 1%%, in s (default {SURFACE_DECAY_S})")
+    parser.add_argument("--surface-base", type=float, default=SURFACE_BASE_AMP,
+                        help=f"hard surface PWM amplitude at zero speed (default {SURFACE_BASE_AMP:.0f})")
+    parser.add_argument("--surface-gain", type=float, default=SURFACE_AMP_PER_CM_S,
+                        help=f"extra PWM amplitude per cm/s of impact (default {SURFACE_AMP_PER_CM_S:.0f})")
+    parser.add_argument("--surface-max", type=float, default=SURFACE_MAX_AMP,
+                        help=f"hard surface PWM amplitude cap, at most 400 (default "
+                             f"{SURFACE_MAX_AMP:.0f})")
     parser.add_argument("--duration", type=float, default=None,
                         help="seconds to run (default: until Ctrl+C)")
     parser.add_argument("--log", default=None, help="write every tick to this CSV file")
@@ -492,7 +606,7 @@ def main(argv=None):
         with open(args.log, "w", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["t_s", "xh_cm", "target", "goal", "position", "load", "temperature",
-                             "speed", "hold"])
+                             "speed", "hold", "wall_x_cm", "wall_k", "impact_amp"])
             return run(args, writer)
     except KeyboardInterrupt:
         print("stopped")  # Ctrl+C at the prompt; run() has already cleaned up

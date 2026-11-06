@@ -77,6 +77,15 @@ class FakeHapkit:
         raise AssertionError("resetting a full buffer stalled the real stream; drain it instead")
 
 
+class RecordingHapkit:
+    def __init__(self):
+        self.written = []
+
+    def write(self, data):
+        self.written.append(data.decode())
+        return len(data)
+
+
 class FakeClock:
     def __init__(self):
         self.now = 100.0
@@ -263,10 +272,11 @@ class TargetPredictorTests(unittest.TestCase):
         for target in range(2300, gt.CLOSED_TICK - 1, -20):
             self.assertGreaterEqual(predictor.update(target), gt.CLOSED_TICK)
 
-    def test_single_encoder_count_causes_only_small_jitter(self):
+    def test_single_encoder_count_adds_no_wiggle(self):
         predictor = self.predictor()
         predictor.update(2500)
-        self.assertLessEqual(abs(predictor.update(2508) - 2508), 10)
+        self.assertEqual(predictor.update(2508), 2508)
+        self.assertEqual(predictor.update(2508), 2508)
 
     def test_zero_ahead_disables_it(self):
         predictor = self.predictor(0.0)
@@ -383,6 +393,13 @@ class EngageTests(unittest.TestCase):
         gt.disengage(self.gripper, 500, self.output.append)
         self.assertEqual(self.servo.writes, [(40, 0), (48, 500)])
 
+    def test_disengage_finishes_even_if_printing_fails(self):
+        def broken_pipe(_message):
+            raise BrokenPipeError
+
+        gt.disengage(self.gripper, 500, broken_pipe)
+        self.assertEqual(self.servo.writes, [(40, 0), (48, 500)])
+
     def test_disengage_warns_when_servo_stops_answering(self):
         self.servo.silent = True
         gt.disengage(self.gripper, 500, self.output.append)
@@ -492,6 +509,26 @@ class ControlLoopTests(unittest.TestCase):
         self.clock.on_sleep = interrupt
         self.assertEqual(self.run_loop(duration=None), gt.EXIT_OK)
         self.assertIn("--- summary", self.text())
+
+    def test_grasp_turns_the_wall_on_and_handle_moving_right_releases_it(self):
+        ser = RecordingHapkit()
+        wall = gt.ContactWall(ser, lambda ticks: gt.ticks_to_handle(ticks, -7.34), 50.0)
+        self.servo.memory[56:58] = (2125).to_bytes(2, "little")
+        self.servo.follows_goal = False
+        self.servo.memory[60:62] = (212).to_bytes(2, "little")
+        self.hapkit.xh = -7.34
+
+        def release(now):
+            if now > 100.5:
+                self.hapkit.xh = 8.0
+        self.clock.on_sleep = release
+        gripper = make_gripper(self.servo)
+        gt.control_loop(gripper, self.reader, -7.34, 2125, 3000, 1.0, self.output.append, None,
+                        self.clock, self.clock.sleep, wall=wall)
+        self.assertIn("CONTACT at 2125 ticks", self.text())
+        self.assertIn("released: wall off", self.text())
+        self.assertTrue(any(line.startswith("W") for line in ser.written))
+        self.assertEqual(ser.written[-1], "R\n")
 
     def test_reads_use_only_id_6(self):
         self.run_loop(duration=0.1)

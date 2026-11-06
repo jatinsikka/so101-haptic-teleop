@@ -35,6 +35,7 @@ DRAIN_TIMEOUT_S = 5.0
 
 BOOT_LINE = b"# hapkit_gripper"
 SAMPLE_LINE = re.compile(rb"P (-?\d+(?:\.\d+)?)")
+ISR_LINE = re.compile(rb"# isr_max_us (\d+)")
 
 
 class HapkitReader:
@@ -50,6 +51,8 @@ class HapkitReader:
         self.buffer = bytearray()
         self.synced = False
         self.boot_lines = 0
+        self.firmware = None
+        self.isr_max_us = None
         self.startup_discards = 0
         self.bad_lines = 0
 
@@ -100,7 +103,13 @@ class HapkitReader:
     def _parse(self, line):
         if line.startswith(BOOT_LINE):
             self.boot_lines += 1
+            self.firmware = line
             self.synced = True
+            return None
+        if line.startswith(b"#"):
+            match = ISR_LINE.fullmatch(line)
+            if match:
+                self.isr_max_us = int(match.group(1))
             return None
         match = SAMPLE_LINE.fullmatch(line)
         if match is None:
