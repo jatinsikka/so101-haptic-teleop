@@ -3,6 +3,7 @@
     .venv/bin/python -m unittest discover -s poc -v
 """
 
+import signal
 import unittest
 
 from scservo_sdk import PacketHandler
@@ -163,8 +164,21 @@ class MappingTests(unittest.TestCase):
     def test_low_ticks_are_closed(self):
         self.assertLess(gt.CLOSED_TICK, gt.OPEN_TICK)
 
-    def test_midpoint(self):
-        middle = gt.handle_to_ticks(-7.34 + gt.HANDLE_SPAN_CM / 2, -7.34)
+    def test_threshold_is_20_percent_of_the_span(self):
+        self.assertAlmostEqual(gt.CLOSE_THRESHOLD_CM, 0.2 * 15.57)
+
+    def test_stays_closed_from_left_stop_to_threshold(self):
+        for fraction in (0.0, 0.05, 0.1, 0.19, 0.2):
+            with self.subTest(fraction=fraction):
+                xh = -7.34 + fraction * gt.HANDLE_SPAN_CM
+                self.assertEqual(gt.handle_to_ticks(xh, -7.34), gt.CLOSED_TICK)
+
+    def test_opens_just_past_threshold(self):
+        xh = -7.34 + gt.CLOSE_THRESHOLD_CM + 0.1
+        self.assertGreater(gt.handle_to_ticks(xh, -7.34), gt.CLOSED_TICK)
+
+    def test_midpoint_of_operating_range(self):
+        middle = gt.handle_to_ticks(-7.34 + 0.6 * gt.HANDLE_SPAN_CM, -7.34)
         self.assertEqual(middle, round((gt.CLOSED_TICK + gt.OPEN_TICK) / 2))
 
     def test_clamps_past_both_stops(self):
@@ -176,19 +190,44 @@ class MappingTests(unittest.TestCase):
         self.assertLess(gt.OPEN_TICK, gt.MAX_GOAL_TICK)
 
 
+class SignalTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = {sig: signal.getsignal(sig)
+                      for sig in (signal.SIGTSTP, signal.SIGTERM, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(sig, old) for sig, old in self.saved.items()])
+        gt.install_signal_handlers()
+
+    def test_ctrl_z_is_ignored(self):
+        self.assertEqual(signal.getsignal(signal.SIGTSTP), signal.SIG_IGN)
+
+    def test_kill_and_closed_window_take_the_clean_exit(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(sig=sig), self.assertRaises(KeyboardInterrupt):
+                signal.raise_signal(sig)
+
+
 class NextGoalTests(unittest.TestCase):
     def test_rate_limited_both_ways(self):
-        self.assertEqual(gt.next_goal(3000, 2500, 2500, 12), 2512)
-        self.assertEqual(gt.next_goal(2000, 2500, 2500, 12), 2488)
+        self.assertEqual(gt.next_goal(3000, 2500, 2500, 0, 12), 2512)
+        self.assertEqual(gt.next_goal(2000, 2500, 2500, 0, 12), 2488)
 
     def test_reaches_a_close_target_exactly(self):
-        self.assertEqual(gt.next_goal(2505, 2500, 2500, 12), 2505)
+        self.assertEqual(gt.next_goal(2505, 2500, 2500, 0, 12), 2505)
 
-    def test_goal_cannot_run_far_ahead_of_a_blocked_gripper(self):
-        self.assertEqual(gt.next_goal(3000, 2800, 2500, 12), 2500 + gt.MAX_LEAD_TICKS)
+    def test_stalled_gripper_gets_only_the_small_lead(self):
+        self.assertEqual(gt.next_goal(3000, 2800, 2500, 0, 12), 2500 + gt.STALL_LEAD_TICKS)
+        self.assertEqual(gt.next_goal(2000, 2200, 2500, 0, 12), 2500 - gt.STALL_LEAD_TICKS)
+
+    def test_lead_grows_with_speed_in_either_direction(self):
+        self.assertEqual(gt.allowed_lead(0), 50)
+        self.assertEqual(gt.allowed_lead(500), 200)
+        self.assertEqual(gt.allowed_lead(-500), 200)
+
+    def test_lead_is_capped(self):
+        self.assertEqual(gt.allowed_lead(5000), gt.MAX_LEAD_TICKS)
 
     def test_stays_in_servo_limits(self):
-        self.assertEqual(gt.next_goal(3463, 3463, 3472, 12), 3463)
+        self.assertEqual(gt.next_goal(3463, 3463, 3472, 0, 12), 3463)
 
 
 class HoldTests(unittest.TestCase):

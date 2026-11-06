@@ -4,7 +4,8 @@
     .venv/bin/python poc/gripper_teleop.py --gripper-port /dev/cu.wchusbserial... \
         --hapkit-port /dev/cu.usbmodem... --dry-run
 
-Handle left = gripper closed, handle right = gripper open. You zero the handle at the left stop.
+You zero the handle at the left stop. The first 20% of handle travel does nothing: the gripper stays
+closed. Past that threshold it opens, reaching fully open at the right stop.
 
 --dry-run writes nothing: it stays on the read-only port, and you move the handle and gripper by
 hand to confirm the mapping. Without it, the gripper closes at startup because the handle is at the
@@ -18,6 +19,7 @@ Register sources: LeRobot v0.6.1 tables.py lists all of these. Feetech's SMS_STS
 
 import argparse
 import csv
+import signal
 import statistics
 import sys
 import time
@@ -42,17 +44,25 @@ EXIT_TORQUE_ON = 3
 EXIT_SAFETY_STOP = 4
 
 # Mapping. Measured: handle stops 15.57 cm apart. Gripper low ticks = closed, from the direction
-# check. Both goal ends sit 20 ticks inside the servo limits, to avoid pressing into end of travel.
+# check, where the closed gripper read 2038-2040. The open end sits 20 ticks inside the servo limit.
 HANDLE_SPAN_CM = 15.57
-CLOSED_TICK = MIN_GOAL_TICK + 20
+CLOSE_THRESHOLD_FRACTION = 0.20  # share of handle travel, from the left stop, that stays closed
+CLOSE_THRESHOLD_CM = CLOSE_THRESHOLD_FRACTION * HANDLE_SPAN_CM
+CLOSED_TICK = 2040
 OPEN_TICK = MAX_GOAL_TICK - 20
 
 # Control
 RATE_HZ = 50.0
-DEFAULT_TORQUE_LIMIT = 200   # below Overload_Torque = 25%, so a grasp should not trigger it
-DEFAULT_RATE_LIMIT = 600     # ticks/s
-MAX_RATE_LIMIT = 1500        # ticks/s; a hand reached about 1200
-MAX_LEAD_TICKS = 200         # a blocked gripper's goal cannot run far ahead of its position
+DEFAULT_TORQUE_LIMIT = 400   # sets speed; grip force is bounded by the stall lead below
+DEFAULT_RATE_LIMIT = 3000    # ticks/s
+MAX_RATE_LIMIT = 3000        # ticks/s
+
+# Goal lead allowed ahead of the position. Fast motion needs a large lead, but a stalled gripper
+# pushes with force set by its lead: in logged grasps, load was about 4 per tick of error, so 50
+# ticks should hold near 200, below Overload_Torque = 25%.
+STALL_LEAD_TICKS = 50
+LEAD_PER_SPEED = 0.3         # extra ticks of lead per tick/s of measured speed
+MAX_LEAD_TICKS = 300
 
 # Safety
 HANDLE_STALE_S = 0.25
@@ -85,15 +95,25 @@ def clamp(value, low, high):
 
 
 def handle_to_ticks(xh, xh_closed):
-    """Map handle position to a gripper target. xh_closed is the handle's left stop."""
-    opening = clamp((xh - xh_closed) / HANDLE_SPAN_CM, 0.0, 1.0)
+    """Map handle position to a gripper target. xh_closed is the handle's left stop.
+
+    Closed from the left stop up to the threshold, then linear up to open at the right stop.
+    """
+    travel = xh - xh_closed - CLOSE_THRESHOLD_CM
+    opening = clamp(travel / (HANDLE_SPAN_CM - CLOSE_THRESHOLD_CM), 0.0, 1.0)
     return round(CLOSED_TICK + opening * (OPEN_TICK - CLOSED_TICK))
 
 
-def next_goal(target, previous_goal, position, max_step):
+def allowed_lead(speed):
+    """How far the goal may lead the position: small when stalled, larger when moving fast."""
+    return min(MAX_LEAD_TICKS, round(STALL_LEAD_TICKS + LEAD_PER_SPEED * abs(speed)))
+
+
+def next_goal(target, previous_goal, position, speed, max_step):
     """Move toward target by at most max_step, staying near the position and in servo limits."""
     goal = previous_goal + clamp(target - previous_goal, -max_step, max_step)
-    goal = clamp(goal, position - MAX_LEAD_TICKS, position + MAX_LEAD_TICKS)
+    lead = allowed_lead(speed)
+    goal = clamp(goal, position - lead, position + lead)
     return clamp(goal, MIN_GOAL_TICK, MAX_GOAL_TICK)
 
 
@@ -277,7 +297,7 @@ def control_loop(gripper, reader, xh_closed, goal, rate_limit, duration, out, lo
                 if hold:
                     goal = clamp(position, MIN_GOAL_TICK, MAX_GOAL_TICK)
                 else:
-                    goal = next_goal(target, goal, position, max_step)
+                    goal = next_goal(target, goal, position, sample["speed"], max_step)
                 written = gripper.write(GOAL_POSITION_ADDR, 2, goal)
 
                 load = sample["load"]
@@ -398,6 +418,21 @@ def run(args, log, out=print, wait_for_enter=input):
             port.closePort()
 
 
+def raise_keyboard_interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers():
+    """Keep the exit path that turns torque off.
+
+    The servo holds its last goal with torque on until told otherwise. Ctrl+Z would pause this
+    program in that state, so it is ignored. Closing the window or a plain kill exits like Ctrl+C.
+    """
+    signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
+    signal.signal(signal.SIGHUP, raise_keyboard_interrupt)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Drive the gripper from the Hapkit handle.")
     parser.add_argument("--gripper-port", required=True)
@@ -412,14 +447,19 @@ def main(argv=None):
                         help="seconds to run (default: until Ctrl+C)")
     parser.add_argument("--log", default=None, help="write every tick to this CSV file")
     args = parser.parse_args(argv)
+    install_signal_handlers()
 
-    if args.log is None:
-        return run(args, None)
-    with open(args.log, "w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["t_s", "xh_cm", "target", "goal", "position", "load", "temperature",
-                         "speed", "hold"])
-        return run(args, writer)
+    try:
+        if args.log is None:
+            return run(args, None)
+        with open(args.log, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["t_s", "xh_cm", "target", "goal", "position", "load", "temperature",
+                             "speed", "hold"])
+            return run(args, writer)
+    except KeyboardInterrupt:
+        print("stopped")  # Ctrl+C at the prompt; run() has already cleaned up
+        return EXIT_OK
 
 
 if __name__ == "__main__":
