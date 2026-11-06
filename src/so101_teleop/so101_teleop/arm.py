@@ -103,31 +103,30 @@ class Arm:
 
     # ---- what the nodes use
     def read_state(self):
-        """(position rad, velocity rad/s, load -1..1), each a numpy array of shape (6,).
-
-        TODO(you), milestone 1. Use the sync reader set up in __init__ (one packet for all 6 servos):
-          1. self._reader.txRxPacket() -> compare with COMM_SUCCESS (retry once, like _read does)
-          2. self._reader.getData(motor_id, ADDRESS, 2) for PRESENT_POSITION / _SPEED / _LOAD
-          3. speed and load are sign-magnitude: _signed(raw, 15) for speed, _signed(raw, 10) for load
-          4. convert: position -> to_rad(); speed ticks/s -> / TICKS_PER_RAD; load -> / 1000.0
-          If the sync read keeps failing, fall back to self._read() per servo (slow but works).
-        Warm-up: get positions working with plain self._read() first, then switch to sync read and
-        compare `ros2 topic hz` before/after.
-        """
-        raise NotImplementedError("arm.read_state")
+        """(position rad, velocity rad/s, load -1..1), each shape (6,). One packet on the bus."""
+        for _ in range(2):
+            if self._reader.txRxPacket() == COMM_SUCCESS:
+                pos = [self._reader.getData(i, PRESENT_POSITION, 2) for i in IDS]
+                spd = [_signed(self._reader.getData(i, PRESENT_SPEED, 2), 15) for i in IDS]  # bit 15 = sign
+                load = [_signed(self._reader.getData(i, PRESENT_LOAD, 2), 10) for i in IDS]  # bit 10 = sign
+                return to_rad(pos), np.array(spd) / TICKS_PER_RAD, np.array(load) / 1000.0
+        # sync read failed twice: slow per-servo path, positions only (raises if a servo is silent)
+        pos = to_rad([self._read(i, PRESENT_POSITION, 2) for i in IDS])
+        return pos, np.zeros(6), np.zeros(6)
 
     def send_targets(self, targets, joints=range(6)):
-        """Send goal positions (rad) for the joint indices in `joints`, in ONE packet.
-        Returns the clamped targets. Writing a goal turns that servo's torque ON.
-
-        TODO(you), milestone 3:
-          1. clamp to LIMITS (never skip this: it's what keeps a bad command from breaking the arm)
-          2. if not self.can_move: return without writing
-          3. ticks = to_ticks(targets); self._writer.clearParam()
-          4. for each joint j: self._writer.addParam(IDS[j], [SCS_LOBYTE(t), SCS_HIBYTE(t)])
-          5. self._writer.txPacket()
-        """
-        raise NotImplementedError("arm.send_targets")
+        """Goal positions (rad) for the joints in `joints`, in ONE packet. Returns the clamped targets.
+        Writing a goal turns that servo's torque ON."""
+        targets = np.clip(np.asarray(targets, dtype=float), LIMITS[:, 0], LIMITS[:, 1])  # never skip
+        if not self.can_move:
+            return targets
+        ticks = to_ticks(targets)
+        self._writer.clearParam()
+        for j in joints:
+            t = int(ticks[j])
+            self._writer.addParam(IDS[j], [SCS_LOBYTE(t), SCS_HIBYTE(t)])
+        self._writer.txPacket()
+        return targets
 
     def configure(self, p_gain=None, d_gain=None, speed=None, accel=None, torque_limit=None):
         """Write servo-loop settings to all six servos (RAM, lost on power-off)."""

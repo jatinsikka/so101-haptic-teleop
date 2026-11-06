@@ -57,3 +57,4 @@ def release():
     arm.configure(torque_limit=1000)
     arm.close()
     print("released")
+

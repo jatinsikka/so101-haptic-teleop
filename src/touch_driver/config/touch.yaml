@@ -1,0 +1,40 @@
+# touch_driver settings. Every force-related number is clamped to hard caps compiled into
+# haptic_math.hpp (kHardMax*): this file can only make things SOFTER, never exceed them.
+# Stiffness/damping are as FELT AT THE STYLUS (the code divides arm-side distances by map.scale).
+touch_driver:
+  ros__parameters:
+    enable_force: false      # master switch; normally set by the launch arg enable_force:=true
+
+    map:
+      scale: 2.0             # arm wrist moves 2 cm per 1 cm of stylus
+      axis_signs: [1.0, -1.0, 1.0]  # touch x (toward you), y (your right), z (up) -> arm x (out), y, z. Flip one if it goes the wrong way
+      stylus_axis: 0         # column of the Touch rotation matrix along the stylus (check at bring-up)
+      pitch_gain: -1.0       # stylus tilt -> gripper tilt (flip the sign if it tilts the wrong way; 0 = hold the wrist)
+      roll_gain: 1.0         # stylus twist -> wrist_roll
+
+    max_joint_speed: 2.0     # rad/s: the arm target never moves a joint faster than this (STS3215 ~4.7 rad/s)
+    max_force_N: 0.8        # Touch: 0.88 N rated continuous, 3.3 N peak. Hard cap 1.5
+    slew_N_per_s: 10.0       # hard cap 50
+    engage_ramp_s: 0.5
+    velocity_lpf_hz: 30.0    # smooths the velocity used by damping (lower = smoother, but laggier)
+    free_damping: 0.3       # N/(m/s) while engaged. Hard cap 2.0
+
+    wall:                    # a plane in the ARM frame (base_link), acts on the tool tip
+      enabled: true          # drawn + stops the arm; pushes only with enable_force:=true. Toggle with [w]
+      point: [0.0, 0.0, 0.05]
+      normal: [0.0, 0.0, 1.0]  # points to the FREE side
+      stiffness: 150.0       # N/m. Hard cap 250 (Touch max ~400)
+      damping: 0.5           # N/(m/s). Hard cap 2.0
+
+    reach:                   # feel the arm's reach and joint limits
+      enabled: true
+      stiffness: 100.0
+
+    feedback:                # feel the follower lagging/blocked behind the target
+      enabled: false         # also toggled with [b] in the window
+      stiffness: 50.0
+      deadband_m: 0.01       # gaps smaller than this (normal tracking lag) are not felt
+      lpf_hz: 15.0
+      watchdog_s: 0.1        # follower states older than this are ignored
+
+    home: [0.0, -0.8, 0.8, 0.0, 0.0]  # ghost pose until the follower is heard (tool ~30 cm out, 22 cm up)

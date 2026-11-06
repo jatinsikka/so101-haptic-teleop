@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>touch_driver</name>
+  <version>0.2.0</version>
+  <description>Geomagic Touch (through CHAI3D) as the SO-101 leader: Cartesian map with clutch, analytic IK, virtual wall, follower feedback, layered safety</description>
+  <maintainer email="jsikka@utexas.edu">Jatin Sikka</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>urdf</depend>
+  <!-- CHAI3D 3.3 is not a ROS package: found through CHAI3D_ROOT in CMakeLists.txt -->
+
+  <test_depend>kdl_parser</test_depend>
+  <test_depend>orocos_kdl_vendor</test_depend>
+
+  <exec_depend>so101_description</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
