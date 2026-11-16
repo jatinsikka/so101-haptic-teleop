@@ -24,6 +24,10 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("enable_force", default_value="false",
                               description="true = the Touch may push (limits from touch.yaml)"),
+        DeclareLaunchArgument("max_joint_speed", default_value="2.0",
+                              description="rad/s cap on the arm target (node clamps to 0.1-4.0)"),
+        DeclareLaunchArgument("wall_mode", default_value="proxy",
+                              description="start mode: proxy or cbf ([c] in the window switches)"),
         Node(
             package="touch_driver",
             executable="touch_node",
@@ -33,7 +37,9 @@ def generate_launch_description():
                 str(mine / "config" / "touch.yaml"),
                 {"robot_description": urdf,
                  "description_dir": str(desc),  # meshes for the window
-                 "enable_force": ParameterValue(LaunchConfiguration("enable_force"), value_type=bool)},
+                 "enable_force": ParameterValue(LaunchConfiguration("enable_force"), value_type=bool),
+                 "max_joint_speed": ParameterValue(LaunchConfiguration("max_joint_speed"), value_type=float),
+                 "wall.mode": LaunchConfiguration("wall_mode")},
             ],
         ),
     ])

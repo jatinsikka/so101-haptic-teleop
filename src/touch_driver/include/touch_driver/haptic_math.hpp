@@ -19,9 +19,11 @@ constexpr double kPi = 3.14159265358979323846;  // M_PI isn't standard C++
 // Hard caps. Compiled in so the YAML can only go lower.
 // Touch: 3.3 N peak, 0.88 N continuous, ~400 N/m, ~4 N/(m/s).
 constexpr double kHardMaxForce_N = 1.5;
-constexpr double kHardMaxStiffness_N_per_m = 250;
+constexpr double kHardMaxStiffness_N_per_m = 400;  // CHAI3D's spec for the Touch
 constexpr double kHardMaxDamping_Ns_per_m = 2.0;
 constexpr double kHardMaxSlew_N_per_s = 50.0;
+constexpr double kHardMaxTransient_N = 0.5;   // contact vibration peak
+constexpr double kHardMaxTransient_s = 0.1;   // contact vibration length
 
 // ---- vectors
 inline double clamp(double x, double lo, double hi) { return std::min(std::max(x, lo), hi); }
@@ -100,6 +102,42 @@ inline WallProxy wall_proxy(const Wall& w, const Vec3& p) {
 inline double wall_force_mag(double k, double b, double depth_touch, double v_normal) {
   if (depth_touch <= 0.0) return 0.0;
   return std::max(0.0, k * depth_touch - b * v_normal);
+}
+
+// ---- contact transient (event-based haptics): on wall entry, a decaying sinusoid along the normal
+// a(t) = A e^(-t/decay) sin(2 pi f t), A = gain * impact speed (capped). Felt as a crisp "tap".
+// A spring alone feels soft on impact; real hard contact rings briefly.
+struct Transient {
+  bool enabled = true;
+  double gain = 4.0;      // N per (m/s) of impact speed at the stylus
+  double freq_hz = 100.0;
+  double decay_s = 0.02;
+  double max_N = 0.4;     // hard cap kHardMaxTransient_N
+};
+
+inline double transient_amplitude(const Transient& c, double v_in) {
+  return clamp(c.gain * v_in, 0.0, std::min(c.max_N, kHardMaxTransient_N));
+}
+
+// ---- CBF wall (control barrier function): the alternative to the proxy wall
+// h(x) = n . (x - wall.point)    distance above the wall. Safe set: h >= 0.
+// Rule:  dh/dt >= -alpha * h      approach the wall at most alpha x distance:
+//          far: no limit. 1 cm away, alpha 10/s: max 10 cm/s. At the wall: 0.
+// Each tick the safe point moves toward the hand. If that breaks the rule, only the part of the
+// step INTO the wall is cut (closed form of the 1-constraint QP). Sideways and away: untouched.
+// Never crosses: h_next >= (1 - alpha*dt) * h >= 0 while alpha*dt <= 1.
+inline Vec3 cbf_step(const Wall& w, double alpha, const Vec3& safe, const Vec3& desired, double dt) {
+  const double h = dot(sub(safe, w.point), w.normal);            // distance above the wall now
+  const double into = dot(sub(desired, safe), w.normal);         // this step along n (< 0 = toward)
+  const double allowed = -alpha * std::max(h, 0.0) * dt;        // most we may move toward it
+  if (into >= allowed) return desired;                           // rule holds: follow the hand
+  return add(desired, mul(allowed - into, w.normal));            // cut the normal part only
+}
+
+// t = seconds since contact. Zero outside [0, min(5 decays, hard cap)].
+inline double transient_value(const Transient& c, double amplitude, double t) {
+  if (t < 0.0 || t > std::min(5.0 * c.decay_s, kHardMaxTransient_s)) return 0.0;
+  return amplitude * std::exp(-t / c.decay_s) * std::sin(2.0 * kPi * c.freq_hz * t);
 }
 
 // ---- 4. output safety filter (every force sent goes through this)

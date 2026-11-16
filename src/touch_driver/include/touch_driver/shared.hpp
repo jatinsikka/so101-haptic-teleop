@@ -21,6 +21,7 @@ using Clock = std::chrono::steady_clock;
 struct Config {
   bool enable_force = false;   // false = only zero force is ever sent
   WorkspaceMap map;            // scale + axis signs (anchors set at runtime)
+  bool tip_control = true;     // stylus drives the tool tip (true) or the wrist point (false)
   double max_joint_speed = 2.0;  // rad/s, rate limit on the arm target
   int stylus_axis = 0;         // column of the Touch rotation matrix along the stylus
   double pitch_gain = 1.0;     // stylus pitch -> tool pitch (0 = hold wrist)
@@ -32,6 +33,9 @@ struct Config {
   double velocity_lpf_hz = 30.0;  // low-pass on the stylus velocity used by all damping
   bool wall_enabled = true;    // drawn + stops the arm; force only with enable_force
   Wall wall;
+  bool cbf_mode = false;       // start in CBF (true) or proxy (false) mode. Key [c] switches
+  double cbf_alpha = 5.0;      // 1/s: approach speed limit = alpha x distance (arm side). Start value
+  Transient transient;         // vibration "tap" on wall contact (proxy mode)
   bool reach_enabled = true;   // spring toward what the arm can reach
   double reach_stiffness = 100.0;
   bool feedback_enabled = false;  // spring toward the real follower tip
@@ -65,7 +69,9 @@ struct HapticState {
   std::uint64_t ticks = 0;
   double rate_hz = 0;
   bool engaged = false, fault = false, follower_live = false, in_wall = false, clamped = false;
-  bool wall_on = false, feedback_on = false;
+  bool wall_on = false, feedback_on = false, transient_on = false, cbf_on = false;
+  double cbf_gap = 0;          // CBF: how far the hand is ahead of the arm target, toward the wall [m]
+  double cbf_alpha = 0;        // current alpha [1/s]
   Fault fault_reason = Fault::kNone;
   Vec3 force{};              // sent to the Touch (touch frame)
   double pitch = 0, twist = 0;
@@ -79,7 +85,9 @@ struct Shared {
   std::mutex from_ros_mtx, state_mtx;
   FromRos from_ros;
   HapticState state;
-  std::atomic<bool> wall_on{false}, feedback_on{false};  // window keys (only when not engaged)
+  std::atomic<bool> wall_on{false}, feedback_on{false}, transient_on{false};  // window keys (only when not engaged)
+  std::atomic<bool> cbf_on{false};  // [c]: wall mode, CBF (true) or proxy (false)
+  std::atomic<double> cbf_alpha{5.0};  // [1]-[5]: alpha presets, live (only changes the speed limit: no force step)
 };
 
 }  // namespace touch

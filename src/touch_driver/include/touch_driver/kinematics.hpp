@@ -3,10 +3,11 @@
 //
 // Model: planar 3-link arm (lift, elbow, wrist_flex: parallel axes) on a turntable (pan).
 //   wrist_roll spins about the gripper axis; the tool point is ON that axis, so roll can't move it.
-// IK (wrist-center: the hand sets the wrist point W, the tilt sets the tool pitch):
-//   1. pan from atan2 of W seen from above
-//   2. in the arm plane: shoulder->W by the law of cosines
-//   3. wrist_flex = pitch - lift - elbow
+// IK (target = tool tip T or wrist point W; the tilt sets the tool pitch phi):
+//   1. pan from atan2 of the target seen from above (T and W share the arm plane)
+//   2. tip target: W = T - tool vector at pitch phi (tilt pivots about the tip)
+//   3. in the arm plane: shoulder->W by the law of cosines
+//   4. wrist_flex = pitch - lift - elbow
 //
 // Plane coords (r, z): r = horizontal distance from the pan axis.
 // alpha_i = c_i * q_i (c_i = +-1 from the URDF axis direction), CCW in (r, z).
@@ -68,15 +69,18 @@ inline ArmPose forward(const PlanarArm& a, const Arm5& q) {
 
 struct IkResult {
   Arm5 q{};
-  Vec3 reached{};        // FK(q).W; != target if clamped
+  Vec3 reached{};        // FK(q).T (tip) or .W (wrist); != target if clamped
   bool clamped = false;  // out of reach or joint limit hit
 };
 
-// Wrist-center IK. target: wrist point W (base_link). phi: tool pitch. roll: wrist_roll.
-// Tilt (phi) only moves wrist_flex; shoulder/elbow depend on W alone.
+// Control point: the tool tip or the wrist point of a pose.
+inline const Vec3& control_point(const ArmPose& p, bool tip) { return tip ? p.T : p.W; }
+
+// IK. target: tool tip (tip=true) or wrist point (base_link). phi: tool pitch. roll: wrist_roll.
 // One solution only (no branch switching): pan faces the target, elbow bends the same way as at
 // the zero pose. q_prev is only used when the target is above the pan axis.
-inline IkResult inverse(const PlanarArm& a, const Vec3& target, double phi, double roll, const Arm5& q_prev) {
+inline IkResult inverse(const PlanarArm& a, const Vec3& target, double phi, double roll, const Arm5& q_prev,
+                        bool tip = false) {
   IkResult res;
   Arm5& q = res.q;
 
@@ -87,9 +91,12 @@ inline IkResult inverse(const PlanarArm& a, const Vec3& target, double phi, doub
   if (rho2 - a.d * a.d > 0.02 * 0.02) alpha0 = std::atan2(dy, dx) - std::atan2(a.d, std::sqrt(rho2 - a.d * a.d));
   q[0] = clamp(alpha0 / a.c0, a.lo[0], a.hi[0]);
   alpha0 = a.c0 * q[0];
-  const Vec2 P{dx * std::cos(alpha0) + dy * std::sin(alpha0), target[2]};  // target in the arm plane
+  Vec2 P{dx * std::cos(alpha0) + dy * std::sin(alpha0), target[2]};  // target in the arm plane
 
-  // ---- 2. shoulder -> wrist: 2-link, law of cosines
+  // ---- 2. tip target -> wrist point: back off along the tool at pitch phi
+  if (tip) P = sub2(P, rot2(phi, sub2(a.T, a.W)));
+
+  // ---- 3. shoulder -> wrist: 2-link, law of cosines
   const Vec2 L1 = sub2(a.E, a.S), L2 = sub2(a.W, a.E);
   const double l1 = norm2(L1), l2 = norm2(L2);
   const double b1 = std::atan2(L1[1], L1[0]), b2 = std::atan2(L2[1], L2[0]);
@@ -111,14 +118,14 @@ inline IkResult inverse(const PlanarArm& a, const Vec3& target, double phi, doub
   const double a1 = wrap_angle(g1 - b1);
   const double a2 = wrap_angle(b1 + delta - b2);
 
-  // ---- 3. wrist: whatever is left of the pitch
+  // ---- 4. wrist: whatever is left of the pitch
   const double a3 = wrap_angle(phi - a1 - a2);
   q[1] = clamp(a1 / a.c[1], a.lo[1], a.hi[1]);
   q[2] = clamp(a2 / a.c[2], a.lo[2], a.hi[2]);
   q[3] = clamp(a3 / a.c[3], a.lo[3], a.hi[3]);
   q[4] = clamp(roll, a.lo[4], a.hi[4]);
 
-  res.reached = forward(a, q).W;
+  res.reached = control_point(forward(a, q), tip);
   res.clamped = norm(sub(res.reached, target)) > 1e-4;
   return res;
 }

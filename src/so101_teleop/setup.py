@@ -21,6 +21,7 @@ setup(
             "teleop = so101_teleop.teleop:main",
             "hapkit = so101_teleop.hapkit:main",
             "camera = so101_teleop.camera:main",
+            "wall_metrics = so101_teleop.wall_metrics:main",
             "find_ports = so101_teleop.tools:find_ports",
             "find_cameras = so101_teleop.tools:find_cameras",
             "release = so101_teleop.tools:release",

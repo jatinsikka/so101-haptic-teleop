@@ -17,6 +17,9 @@ Push-Location C:\pixi_ws   # the pixi env's activation uses the current dir
 (& "$env:LOCALAPPDATA\pixi\bin\pixi.exe" shell-hook -s powershell) -join "`n" | Invoke-Expression
 Pop-Location
 
+# Smart App Control blocks pixi's cmake.exe (WinError 4551): colcon uses Visual Studio's instead
+$env:CMAKE_COMMAND = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+
 . C:\pixi_ws\ros2-windows\local_setup.ps1 2>$null   # silences the harmless RTI Connext warning
 if (Test-Path "$PSScriptRoot\install\local_setup.ps1") {
     . "$PSScriptRoot\install\local_setup.ps1"

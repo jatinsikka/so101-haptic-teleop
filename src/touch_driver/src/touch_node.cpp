@@ -3,6 +3,9 @@
 //        /leader/engaged       deadman: teleop moves the follower only while true
 //        /touch/force          [fx, fy, fz] sent to the Touch [N] (touch frame)
 //                              (Float64MultiArray: Smart App Control blocks geometry_msgs' DLL)
+//        /touch/metrics        per follower state (50 Hz), for wall_metrics.py:
+//                              [t s, cbf 0/1, engaged 0/1, cmd tip h m, real tip h m, |F| N, alpha 1/s]
+//                              h = height of the tool tip above the wall (< 0 = inside)
 //   sub  /follower/joint_states
 //   srv  /touch/clear_fault
 // Threads: main = window, ROS spin thread, CHAI3D haptic thread. Shared via shared.hpp.
@@ -37,6 +40,7 @@ class TouchRos : public rclcpp::Node {
     pub_q_ = create_publisher<sensor_msgs::msg::JointState>("/leader/joint_states", 10);
     pub_engaged_ = create_publisher<std_msgs::msg::Bool>("/leader/engaged", 10);
     pub_force_ = create_publisher<std_msgs::msg::Float64MultiArray>("/touch/force", 10);
+    pub_metrics_ = create_publisher<std_msgs::msg::Float64MultiArray>("/touch/metrics", 100);
     sub_follower_ = create_subscription<sensor_msgs::msg::JointState>(
         "/follower/joint_states", rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::JointState::ConstSharedPtr m) { on_follower(*m); });
@@ -79,6 +83,9 @@ class TouchRos : public rclcpp::Node {
       if (std::fabs(std::fabs(sg[i]) - 1.0) > 1e-9) throw std::runtime_error("map.axis_signs must be +1 or -1");
       c.map.sign[i] = sg[i];
     }
+    const std::string cp = declare_parameter<std::string>("map.control_point", "tip");
+    if (cp != "tip" && cp != "wrist") throw std::runtime_error("map.control_point must be 'tip' or 'wrist'");
+    c.tip_control = cp == "tip";
     c.max_joint_speed = num("max_joint_speed", c.max_joint_speed, 0.1, 4.0);
     c.stylus_axis = static_cast<int>(clamp(declare_parameter("map.stylus_axis", 0), 0, 2));
     c.pitch_gain = num("map.pitch_gain", c.pitch_gain, -2.0, 2.0);
@@ -99,6 +106,16 @@ class TouchRos : public rclcpp::Node {
     c.wall.normal = mul(1.0 / norm(nv), nv);
     c.wall.stiffness = num("wall.stiffness", c.wall.stiffness, 0.0, kHardMaxStiffness_N_per_m);
     c.wall.damping = num("wall.damping", c.wall.damping, 0.0, kHardMaxDamping_Ns_per_m);
+    const std::string mode = declare_parameter<std::string>("wall.mode", "proxy");
+    if (mode != "proxy" && mode != "cbf") throw std::runtime_error("wall.mode must be 'proxy' or 'cbf'");
+    c.cbf_mode = mode == "cbf";
+    c.cbf_alpha = num("wall.cbf_alpha", c.cbf_alpha, 1.0, 100.0);  // alpha*dt <= 1 keeps the guarantee
+
+    c.transient.enabled = declare_parameter("transient.enabled", c.transient.enabled);
+    c.transient.gain = num("transient.gain", c.transient.gain, 0.0, 20.0);
+    c.transient.freq_hz = num("transient.freq_hz", c.transient.freq_hz, 20.0, 300.0);
+    c.transient.decay_s = num("transient.decay_s", c.transient.decay_s, 0.005, 0.05);
+    c.transient.max_N = num("transient.max_N", c.transient.max_N, 0.0, kHardMaxTransient_N);
 
     c.reach_enabled = declare_parameter("reach.enabled", c.reach_enabled);
     c.reach_stiffness = num("reach.stiffness", c.reach_stiffness, 0.0, kHardMaxStiffness_N_per_m);
@@ -113,9 +130,10 @@ class TouchRos : public rclcpp::Node {
     for (int i = 0; i < 5; ++i) c.home[i] = h[i];
     c.description_dir = declare_parameter<std::string>("description_dir", "");
 
-    RCLCPP_INFO(get_logger(), "forces %s | max %.2f N | scale %.2f, signs [%+.0f %+.0f %+.0f] | wall %s | feedback %s",
+    RCLCPP_INFO(get_logger(), "forces %s | max %.2f N | scale %.2f, signs [%+.0f %+.0f %+.0f] | control %s | wall %s | feedback %s",
                 c.enable_force ? "ENABLED" : "DISABLED (zero force only)", c.max_force_N, c.map.scale, c.map.sign[0],
-                c.map.sign[1], c.map.sign[2], c.wall_enabled ? "on" : "off", c.feedback_enabled ? "on" : "off");
+                c.map.sign[1], c.map.sign[2], c.tip_control ? "tip" : "wrist", c.wall_enabled ? "on" : "off",
+                c.feedback_enabled ? "on" : "off");
   }
 
   void on_follower(const sensor_msgs::msg::JointState& m) {
@@ -129,10 +147,23 @@ class TouchRos : public rclcpp::Node {
           break;
         }
     if (found != 5) return;  // incomplete: ignore
-    std::lock_guard<std::mutex> lk(shared_.from_ros_mtx);
-    shared_.from_ros.q_follower = q;
-    shared_.from_ros.stamp = touch::Clock::now();
-    shared_.from_ros.have_follower = true;
+    {
+      std::lock_guard<std::mutex> lk(shared_.from_ros_mtx);
+      shared_.from_ros.q_follower = q;
+      shared_.from_ros.stamp = touch::Clock::now();
+      shared_.from_ros.have_follower = true;
+    }
+    publish_metrics(q);
+  }
+
+  // Tip heights above the wall: commanded (ghost) and real (FK of the follower's joints).
+  void publish_metrics(const Arm5& q_real) {
+    const touch::HapticState s = snapshot();
+    const auto height = [this](const Vec3& tip) { return touch::dot(touch::sub(tip, cfg_.wall.point), cfg_.wall.normal); };
+    std_msgs::msg::Float64MultiArray m;
+    m.data = {now().seconds(), s.cbf_on ? 1.0 : 0.0, s.engaged ? 1.0 : 0.0, height(s.p_tool),
+              height(touch::forward(arm_, q_real).T), touch::norm(s.force), s.cbf_alpha};
+    pub_metrics_->publish(m);
   }
 
   touch::HapticState snapshot() {
@@ -182,7 +213,7 @@ class TouchRos : public rclcpp::Node {
   touch::RobotModel model_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_q_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_engaged_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_force_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_force_, pub_metrics_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_follower_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_clear_;
   rclcpp::TimerBase::SharedPtr timer_pub_, timer_log_;
