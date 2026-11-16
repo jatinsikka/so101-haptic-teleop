@@ -1,12 +1,15 @@
 // Touch via CHAI3D: haptic loop + window. Structure from CHAI3D examples/GLFW/01-mydevice.
 //
+// Each 1 kHz tick: read_touch -> read_ros -> deadman -> update_target -> compute_force -> output
+// -> publish_state. Wall modes: PROXY (stop at contact) or CBF (slow down before it), key [c].
+//
 // CHAI3D's Phantom driver does NOT clamp forces, check errors, or report calibration
 // (and getPosition() returns false on success). All safety is here + haptic_math.hpp:
 //   1. enable_force=false -> zero force only
 //   2. deadman: button 1 held, fresh press only
 //   3. engage ramp
 //   4. follower watchdog
-//   5. safe_force: NaN -> fault, clamp, slew
+//   5. safe_force: NaN -> fault, clamp, slew. Contact tap: own caps (0.5 N, 0.1 s)
 //   6. fault latch until /touch/clear_fault
 //   7. shutdown: zero force, stop loop, then close device
 // Pacing: setForce...() waits for the device's 1 kHz servo tick; no sleep needed.
@@ -343,20 +346,19 @@ struct HapticApp::Impl {
       return {0, 0, 0};
     }
     const Vec3& v = L.v_filt;
+    const Vec3 n = arm_dir_to_touch(L.map, cfg.wall.normal);  // wall normal, touch frame
     Vec3 F = mul(-cfg.free_damping, v);    // damping
+
     // wall: spring-damper on how far the hand is past the arm target, along the wall normal.
     //   proxy: depth = hand inside the wall (felt only after contact)
     //   CBF:   + cbf_gap = hand ahead of the slowed target (felt BEFORE contact, when too fast)
     const double wall_depth = L.depth + L.cbf_gap;
-    if (wall_depth > 0.0) {
-      const Vec3 n = arm_dir_to_touch(L.map, cfg.wall.normal);
-      const double f = wall_force_mag(cfg.wall.stiffness, cfg.wall.damping, wall_depth / L.map.scale, dot(v, n));
-      F = add(F, mul(f, n));
-    }
+    if (wall_depth > 0.0)
+      F = add(F, mul(wall_force_mag(cfg.wall.stiffness, cfg.wall.damping, wall_depth / L.map.scale, dot(v, n)), n));
+
     // contact tap: decaying sinusoid along the normal, scaled by impact speed. Once per entry.
     const bool in_wall = L.depth > 0.0;
     if (shared.transient_on) {
-      const Vec3 n = arm_dir_to_touch(L.map, cfg.wall.normal);
       if (in_wall && !L.was_in_wall && L.tr_t > kHardMaxTransient_s) {
         L.tr_t = 0.0;
         L.tr_A = transient_amplitude(cfg.transient, std::max(0.0, -dot(v, n)));  // speed INTO the wall

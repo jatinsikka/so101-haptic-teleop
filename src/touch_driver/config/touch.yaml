@@ -22,12 +22,12 @@ touch_driver:
 
     wall:                    # a plane in the ARM frame (base_link), acts on the tool tip
       enabled: true          # drawn + stops the arm; pushes only with enable_force:=true. Toggle with [w]
+      mode: proxy            # start mode ([c] switches). proxy: stop AT the wall. cbf: slow down BEFORE it
+      cbf_alpha: 5.0         # 1/s. CBF: approach speed <= alpha x distance (1 cm away -> 5 cm/s). [1]-[5] live
       point: [0.0, 0.0, 0.01]  # the table is z = 0: 1 cm margin for the jaws + overshoot
       normal: [0.0, 0.0, 1.0]  # points to the FREE side
       stiffness: 400.0       # N/m. Hard cap 400 (Touch max). Buzzes? raise damping first, then lower this
       damping: 1.0           # N/(m/s). Hard cap 2.0
-      mode: proxy            # start mode, [c] switches. proxy: stop AT the wall. cbf: slow down BEFORE it
-      cbf_alpha: 5.0         # 1/s. CBF approach speed limit = alpha x distance (1 cm away -> 5 cm/s). Keys [1]-[5] live
 
     transient:               # "tap" on wall contact: decaying sinusoid, scaled by impact speed. Toggle with [t]
       enabled: true

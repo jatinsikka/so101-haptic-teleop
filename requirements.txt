@@ -1,0 +1,5 @@
+# pip packages for so101_teleop, installed INTO the ROS (pixi) Python. See SETUP.md step 4.
+#   . .\ros2_env.ps1 ; python -m pip install -r requirements.txt
+# numpy and OpenCV come from the pixi environment (C:\pixi_ws\pixi.toml): do not pip-install them.
+feetech-servo-sdk==1.0.0   # STS3215 servo bus (import scservo_sdk)
+pyserial==3.5

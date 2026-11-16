@@ -130,10 +130,11 @@ class TouchRos : public rclcpp::Node {
     for (int i = 0; i < 5; ++i) c.home[i] = h[i];
     c.description_dir = declare_parameter<std::string>("description_dir", "");
 
-    RCLCPP_INFO(get_logger(), "forces %s | max %.2f N | scale %.2f, signs [%+.0f %+.0f %+.0f] | control %s | wall %s | feedback %s",
+    RCLCPP_INFO(get_logger(), "forces %s | max %.2f N | scale %.2f, signs [%+.0f %+.0f %+.0f] | control %s | "
+                "wall %s, %s (alpha %.0f) | feedback %s",
                 c.enable_force ? "ENABLED" : "DISABLED (zero force only)", c.max_force_N, c.map.scale, c.map.sign[0],
                 c.map.sign[1], c.map.sign[2], c.tip_control ? "tip" : "wrist", c.wall_enabled ? "on" : "off",
-                c.feedback_enabled ? "on" : "off");
+                c.cbf_mode ? "CBF" : "proxy", c.cbf_alpha, c.feedback_enabled ? "on" : "off");
   }
 
   void on_follower(const sensor_msgs::msg::JointState& m) {
