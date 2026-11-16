@@ -4,15 +4,15 @@
 
 | part | status |
 |---|---|
-| Touch → real SO-101 teleop | **Working.** Push in = forward, tilt bends the wrist, wall 1 cm above the table |
-| Walls | PROXY + CBF, switchable live (`c`), CBF α live (`1`–`5`). Harder wall (400 N/m) + contact tap |
+| Touch → real SO-101 teleop | **Working.** Push in = forward, tilt bends the wrist, wall 1.5 cm above the table |
+| Fixture | OFF / IMPEDANCE / CBF (`c`), filter always (`f`), rubber band (`h`), K and α live (arrows, `1`–`5`). 400 N/m, 2.5 N, 200 N/s |
 | Metrics | `wall_metrics` logs every approach; first run analysed (below) |
 | Follower | All 6 servos answer, 28–30 °C at rest. Servo 1 (pan) overheated once (72 °C) in an early run |
 | Hapkit, camera | Not started (teammate's Hapkit code is separate) |
 
-**Next:** ~10 approaches per setting (PROXY, CBF α 2/5/20), resting on the wall, for the slide.
+**Next:** test Phase 1 on the arm, then ~10 approaches per setting (OFF, IMPEDANCE, CBF at K/α 1/3/5) for the slide.
 
-## First wall measurements (run 2026-11-15 22:35, fast profile)
+## First wall measurements (run 2026-11-15 22:35, fast profile, old PROXY wall vs first CBF)
 
 | | PROXY (29) | CBF α 10 (8) |
 |---|---|---|
@@ -37,6 +37,13 @@
 | 11-15 | hand drives the wrist point; dot drawn at the tip | tip control made tilt swing the whole arm (jittery) |
 | 11-15 | paper: Bloom et al., *Haptic virtual fixtures using CBFs* (ToH 2026) | covers the walls and the planned camera barriers |
 | 11-15 | measure approach speed + sag, not just "below the wall" | sag dominated the raw numbers |
+| 11-16 | CBF rebuilt to the paper: tracking `u = K·gap`, filter `Ψ`, force `D·(u* − u)`, knob = K/α | match Bloom et al.; demo their eq. 35 live |
+| 11-16 | stiffer contact: 1.5 N, 50 N/s, wall damping 1.5 | 400 N/m is already the Touch's max |
+| 11-16 | removed the contact tap and the tip-control option | unused; tip control made the arm jittery |
+| 11-16 | Phase 1 of the paper demo: modes OFF / IMPEDANCE / CBF, `f` filter always, rubber band (eq. 8), live K and α, floor backstop | the paper's three conditions + its K/α result, live |
+| 11-16 | IMPEDANCE leaves the arm free; old proxy and follower-feedback spring removed | shows the paper's point (impedance needs a violation); the rubber band replaces the feedback spring |
+| 11-16 | harder wall: 2.5 N, 200 N/s slew, wall damping 2.5 (caps 2.5 N, 4 N·s/m, 200 N/s) | 400 N/m is the Touch max; at 1.5 N / 50 N/s the spring saturated at 4 mm and took 30 ms to rise |
+| next | Phase 2: joint-space QP (eq. 22) with joint speed + position limits | the paper's IK-QP, minus the wheel constraint |
 
 ## Gotchas
 - **Every terminal:** `. .\ros2_env.ps1` (loads MSVC + ROS). Without it: `ModuleNotFoundError: so101_teleop`.
@@ -54,7 +61,7 @@
 - **`.solution/` is gitignored.** Never push it.
 
 ## Open items
-- [ ] Full metrics run (PROXY vs CBF at several α), then the slide.
+- [ ] Full metrics run (OFF vs IMPEDANCE vs CBF at several K/α), then the slide.
 - [ ] Explain the one CBF sample commanded below the wall.
 - [ ] Reduce sag (torque limit / gains) or raise the wall so table hits mean overshoot.
 - [ ] Hapkit gripper (`/hapkit/gripper_cmd`), then the camera barriers (CBF around detected objects).

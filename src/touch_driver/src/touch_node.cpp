@@ -4,7 +4,8 @@
 //        /touch/force          [fx, fy, fz] sent to the Touch [N] (touch frame)
 //                              (Float64MultiArray: Smart App Control blocks geometry_msgs' DLL)
 //        /touch/metrics        per follower state (50 Hz), for wall_metrics.py:
-//                              [t s, cbf 0/1, engaged 0/1, cmd tip h m, real tip h m, |F| N, alpha 1/s]
+//                              [t s, mode 0 OFF/1 IMPEDANCE/2 CBF, engaged 0/1, cmd tip h m, real tip h m,
+//                               |F| N, K 1/s, alpha 1/s, CBF filter on 0/1]
 //                              h = height of the tool tip above the wall (< 0 = inside)
 //   sub  /follower/joint_states
 //   srv  /touch/clear_fault
@@ -83,11 +84,8 @@ class TouchRos : public rclcpp::Node {
       if (std::fabs(std::fabs(sg[i]) - 1.0) > 1e-9) throw std::runtime_error("map.axis_signs must be +1 or -1");
       c.map.sign[i] = sg[i];
     }
-    const std::string cp = declare_parameter<std::string>("map.control_point", "tip");
-    if (cp != "tip" && cp != "wrist") throw std::runtime_error("map.control_point must be 'tip' or 'wrist'");
-    c.tip_control = cp == "tip";
     c.max_joint_speed = num("max_joint_speed", c.max_joint_speed, 0.1, 4.0);
-    c.stylus_axis = static_cast<int>(clamp(declare_parameter("map.stylus_axis", 0), 0, 2));
+    c.stylus_axis = static_cast<int>(std::min<int64_t>(std::max<int64_t>(declare_parameter("map.stylus_axis", 0), 0), 2));
     c.pitch_gain = num("map.pitch_gain", c.pitch_gain, -2.0, 2.0);
     c.roll_gain = num("map.roll_gain", c.roll_gain, -2.0, 2.0);
 
@@ -97,7 +95,6 @@ class TouchRos : public rclcpp::Node {
     c.free_damping = num("free_damping", c.free_damping, 0.0, kHardMaxDamping_Ns_per_m);
     c.velocity_lpf_hz = num("velocity_lpf_hz", c.velocity_lpf_hz, 5.0, 200.0);
 
-    c.wall_enabled = declare_parameter("wall.enabled", c.wall_enabled);
     auto p = list("wall.point", {c.wall.point[0], c.wall.point[1], c.wall.point[2]});
     auto n = list("wall.normal", {c.wall.normal[0], c.wall.normal[1], c.wall.normal[2]});
     c.wall.point = {p[0], p[1], p[2]};
@@ -106,35 +103,32 @@ class TouchRos : public rclcpp::Node {
     c.wall.normal = mul(1.0 / norm(nv), nv);
     c.wall.stiffness = num("wall.stiffness", c.wall.stiffness, 0.0, kHardMaxStiffness_N_per_m);
     c.wall.damping = num("wall.damping", c.wall.damping, 0.0, kHardMaxDamping_Ns_per_m);
-    const std::string mode = declare_parameter<std::string>("wall.mode", "proxy");
-    if (mode != "proxy" && mode != "cbf") throw std::runtime_error("wall.mode must be 'proxy' or 'cbf'");
-    c.cbf_mode = mode == "cbf";
-    c.cbf_alpha = num("wall.cbf_alpha", c.cbf_alpha, 1.0, 100.0);  // alpha*dt <= 1 keeps the guarantee
+    const std::string mode = declare_parameter<std::string>("wall.mode", "impedance");
+    if (mode == "off") c.mode = FixtureMode::kOff;
+    else if (mode == "impedance") c.mode = FixtureMode::kImpedance;
+    else if (mode == "cbf") c.mode = FixtureMode::kCbf;
+    else throw std::runtime_error("wall.mode must be 'off', 'impedance' or 'cbf'");
+    c.filter_always = declare_parameter("wall.filter_always", c.filter_always);
+    c.floor_below = num("wall.floor_below", c.floor_below, 0.0, 0.05);
+    c.cbf_gain = num("wall.cbf_gain", c.cbf_gain, 1.0, 30.0);       // same range as the live keys
+    c.cbf_alpha = num("wall.cbf_alpha", c.cbf_alpha, 0.5, 100.0);   // alpha * dt <= 1 keeps the guarantee
+    c.cbf_damping = num("wall.cbf_damping", c.cbf_damping, 0.0, kHardMaxStiffness_N_per_m);  // D x K capped live
 
-    c.transient.enabled = declare_parameter("transient.enabled", c.transient.enabled);
-    c.transient.gain = num("transient.gain", c.transient.gain, 0.0, 20.0);
-    c.transient.freq_hz = num("transient.freq_hz", c.transient.freq_hz, 20.0, 300.0);
-    c.transient.decay_s = num("transient.decay_s", c.transient.decay_s, 0.005, 0.05);
-    c.transient.max_N = num("transient.max_N", c.transient.max_N, 0.0, kHardMaxTransient_N);
-
+    c.tracking_enabled = declare_parameter("tracking.enabled", c.tracking_enabled);
+    c.tracking_stiffness = num("tracking.stiffness", c.tracking_stiffness, 0.0, kHardMaxStiffness_N_per_m);
     c.reach_enabled = declare_parameter("reach.enabled", c.reach_enabled);
     c.reach_stiffness = num("reach.stiffness", c.reach_stiffness, 0.0, kHardMaxStiffness_N_per_m);
-
-    c.feedback_enabled = declare_parameter("feedback.enabled", c.feedback_enabled);
-    c.feedback_stiffness = num("feedback.stiffness", c.feedback_stiffness, 0.0, kHardMaxStiffness_N_per_m);
-    c.feedback_deadband_m = num("feedback.deadband_m", c.feedback_deadband_m, 0.0, 0.1);
-    c.feedback_lpf_hz = num("feedback.lpf_hz", c.feedback_lpf_hz, 1.0, 200.0);
-    c.watchdog_s = num("feedback.watchdog_s", c.watchdog_s, 0.02, 1.0);
+    c.watchdog_s = num("follower_watchdog_s", c.watchdog_s, 0.02, 1.0);
 
     const auto h = list("home", std::vector<double>(c.home.begin(), c.home.end()));
     for (int i = 0; i < 5; ++i) c.home[i] = h[i];
     c.description_dir = declare_parameter<std::string>("description_dir", "");
 
-    RCLCPP_INFO(get_logger(), "forces %s | max %.2f N | scale %.2f, signs [%+.0f %+.0f %+.0f] | control %s | "
-                "wall %s, %s (alpha %.0f) | feedback %s",
+    RCLCPP_INFO(get_logger(), "forces %s | max %.2f N | scale %.2f, signs [%+.0f %+.0f %+.0f] | "
+                "fixture %s (K %.1f, alpha %.1f, filter always %s) | rubber band %s",
                 c.enable_force ? "ENABLED" : "DISABLED (zero force only)", c.max_force_N, c.map.scale, c.map.sign[0],
-                c.map.sign[1], c.map.sign[2], c.tip_control ? "tip" : "wrist", c.wall_enabled ? "on" : "off",
-                c.cbf_mode ? "CBF" : "proxy", c.cbf_alpha, c.feedback_enabled ? "on" : "off");
+                c.map.sign[1], c.map.sign[2], mode_name(c.mode), c.cbf_gain, c.cbf_alpha,
+                c.filter_always ? "on" : "off", c.tracking_enabled ? "on" : "off");
   }
 
   void on_follower(const sensor_msgs::msg::JointState& m) {
@@ -162,8 +156,9 @@ class TouchRos : public rclcpp::Node {
     const touch::HapticState s = snapshot();
     const auto height = [this](const Vec3& tip) { return touch::dot(touch::sub(tip, cfg_.wall.point), cfg_.wall.normal); };
     std_msgs::msg::Float64MultiArray m;
-    m.data = {now().seconds(), s.cbf_on ? 1.0 : 0.0, s.engaged ? 1.0 : 0.0, height(s.p_tool),
-              height(touch::forward(arm_, q_real).T), touch::norm(s.force), s.cbf_alpha};
+    m.data = {now().seconds(), static_cast<double>(s.mode), s.engaged ? 1.0 : 0.0, height(s.p_tool),
+              height(touch::forward(arm_, q_real).T), touch::norm(s.force), s.cbf_gain, s.cbf_alpha,
+              s.filter_on ? 1.0 : 0.0};
     pub_metrics_->publish(m);
   }
 

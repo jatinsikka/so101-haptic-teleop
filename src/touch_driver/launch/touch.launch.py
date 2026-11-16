@@ -26,8 +26,8 @@ def generate_launch_description():
                               description="true = the Touch may push (limits from touch.yaml)"),
         DeclareLaunchArgument("max_joint_speed", default_value="2.0",
                               description="rad/s cap on the arm target (node clamps to 0.1-4.0)"),
-        DeclareLaunchArgument("wall_mode", default_value="proxy",
-                              description="start mode: proxy or cbf ([c] in the window switches)"),
+        DeclareLaunchArgument("wall_mode", default_value="impedance",
+                              description="start mode: off, impedance or cbf ([c] in the window cycles)"),
         Node(
             package="touch_driver",
             executable="touch_node",

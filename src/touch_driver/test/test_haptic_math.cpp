@@ -89,45 +89,55 @@ static void test_safe_force() {
   CHECK(!safe_force({0, 0, 0}, {INFINITY, 0, 0}, 1.0, 10.0, dt, out), "inf prev accepted");
 }
 
-static void test_transient() {
-  Transient c;  // gain 4, 100 Hz, 20 ms, max 0.4
-  CHECK(near(transient_amplitude(c, 0.05), 0.2), "amplitude ~ impact speed");
-  CHECK(near(transient_amplitude(c, 10.0), 0.4), "amplitude capped by max_N");
-  CHECK(near(transient_amplitude(c, -1.0), 0.0), "leaving the wall: no tap");
-  c.max_N = 100.0;
-  CHECK(near(transient_amplitude(c, 10.0), kHardMaxTransient_N), "hard cap beats config");
-  c.max_N = 0.4;
-  double peak = 0;
-  for (double t = 0; t < 0.2; t += 0.001) peak = std::max(peak, std::fabs(transient_value(c, 0.4, t)));
-  CHECK(peak <= 0.4 && peak > 0.2, "peak %g", peak);
-  CHECK(near(transient_value(c, 0.4, 0.0), 0.0), "starts at zero (no step)");
-  CHECK(near(transient_value(c, 0.4, 0.15), 0.0) && near(transient_value(c, 0.4, -0.01), 0.0), "zero outside window");
-  c.decay_s = 1.0;  // a long decay is still cut at the hard length
-  CHECK(near(transient_value(c, 0.4, kHardMaxTransient_s + 0.001), 0.0), "hard length");
+// Simulate the CBF wall as the haptic loop runs it: target x chases the hand at u = K (hand - x),
+// filtered. Wall z = 0, normal +z. The hand moves down at 5 cm/s from z = 10 cm to z = -5 cm.
+// Returns the hand height when the force first switched on, and the lowest target height.
+struct CbfRun {
+  double hand_z_at_activation = NAN, min_target_z = 1e9;
+};
+static CbfRun run_cbf(double K, double alpha) {
+  const Vec3 n{0, 0, 1};
+  const double dt = 0.001;
+  Vec3 x{0.3, 0.0, 0.10};
+  CbfRun out;
+  for (int k = 0; k < 3000; ++k) {
+    const Vec3 hand{0.3, 0.0001 * k, 0.10 - 0.05 * k * dt};       // down 5 cm/s, drifting sideways
+    const Vec3 u = mul(K, sub(hand, x));                          // eq. 7
+    const CbfResult c = cbf_filter(n, x[2], u, alpha);            // h = height above z = 0
+    if (c.removed > 0 && std::isnan(out.hand_z_at_activation)) out.hand_z_at_activation = hand[2];
+    x = add(x, mul(dt, c.u_safe));
+    out.min_target_z = std::min(out.min_target_z, x[2]);
+  }
+  return out;
 }
 
 static void test_cbf() {
-  Wall w;  // plane z = 0.05, normal +z
-  const double alpha = 10.0, dt = 0.001;
-  // far away, normal speed (0.1 mm per 1 ms tick = 0.1 m/s; limit there 10 x 0.25 = 2.5 m/s): follows the hand
-  Vec3 s = cbf_step(w, alpha, {0.3, 0, 0.30}, {0.3, 0, 0.2999}, dt);
-  CHECK(near3(s, {0.3, 0, 0.2999}), "far: follow the hand");
-  // slam the hand 10 cm below the wall for 2 s: the safe point never crosses, slows, gets close
-  s = {0.3, 0, 0.10};
-  double worst_rate = 0;
-  for (int k = 0; k < 2000; ++k) {
-    const Vec3 next = cbf_step(w, alpha, s, {0.3, 0.001 * k, -0.05}, dt);  // also sliding sideways
-    const double h = s[2] - 0.05, h_next = next[2] - 0.05;
-    CHECK(h_next >= -1e-12, "crossed the wall at step %d (h %g)", k, h_next);
-    worst_rate = std::max(worst_rate, (h - h_next) / dt - alpha * h);  // must be <= 0
-    s = next;
+  const Vec3 n{0, 0, 1};
+  // closed form: safe command untouched; too fast toward the wall -> exactly -alpha h along n
+  CbfResult c = cbf_filter(n, 0.10, {0.1, 0, -0.5}, 10.0);  // allowed -1.0 m/s, asked -0.5
+  CHECK(c.removed == 0.0 && near3(c.u_safe, {0.1, 0, -0.5}), "safe command untouched");
+  c = cbf_filter(n, 0.01, {0.1, 0, -0.5}, 10.0);            // allowed -0.1 m/s
+  CHECK(near(c.u_safe[2], -0.1) && near(c.u_safe[0], 0.1) && near(c.removed, 0.4), "cut to -alpha h, sideways kept");
+  c = cbf_filter(n, 0.0, {0, 0, 0.3}, 10.0);
+  CHECK(c.removed == 0.0, "leaving the wall is free");
+
+  // the CBF force can never act stiffer than the wall's hard cap, whatever K is set to live
+  CHECK(near(cbf_damping_capped(40.0, 10.0), 40.0), "D kept when D x K is under the cap");
+  CHECK(cbf_damping_capped(40.0, 30.0) * 30.0 <= kHardMaxStiffness_N_per_m + 1e-9, "D x K capped");
+
+  // never crosses, whatever the ratio
+  for (const double ratio : {0.5, 1.0, 3.0}) {
+    const CbfRun r = run_cbf(10.0, 10.0 / ratio);
+    CHECK(r.min_target_z >= -1e-12, "ratio %.1f: target crossed the wall (%g)", ratio, r.min_target_z);
   }
-  CHECK(worst_rate <= 1e-9, "approach faster than alpha*h by %g m/s", worst_rate);
-  CHECK(s[2] - 0.05 < 0.001, "should end close to the wall (h %g)", s[2] - 0.05);
-  CHECK(near(s[1], 0.001 * 1999), "sideways motion untouched (%g)", s[1]);
-  // moving away is never limited
-  s = cbf_step(w, alpha, {0.3, 0, 0.051}, {0.3, 0, 0.20}, dt);
-  CHECK(near(s[2], 0.20), "leaving is free");
+  // paper eq. 35: when the force starts depends on K/alpha
+  const CbfRun before = run_cbf(10.0, 10.0 / 3.0), at = run_cbf(10.0, 10.0), after = run_cbf(10.0, 20.0);
+  CHECK(before.hand_z_at_activation > 0.0, "K/alpha = 3: force before the hand reaches the wall (%g)",
+        before.hand_z_at_activation);
+  CHECK(std::fabs(at.hand_z_at_activation) < 0.002, "K/alpha = 1: force at the wall (%g)", at.hand_z_at_activation);
+  CHECK(after.hand_z_at_activation < 0.0, "K/alpha = 0.5: force only past the wall (%g)", after.hand_z_at_activation);
+  std::printf("CBF activation (hand height when the force starts): K/a=3 %+.1f mm, K/a=1 %+.1f mm, K/a=0.5 %+.1f mm\n",
+              before.hand_z_at_activation * 1000, at.hand_z_at_activation * 1000, after.hand_z_at_activation * 1000);
 }
 
 int main() {
@@ -135,7 +145,6 @@ int main() {
   test_twist();
   test_wall();
   test_safe_force();
-  test_transient();
   test_cbf();
   std::printf(failures ? "%d FAILURE(S)\n" : "all haptic_math tests passed\n", failures);
   return failures ? 1 : 0;

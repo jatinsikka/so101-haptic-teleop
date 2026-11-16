@@ -6,45 +6,42 @@ touch_driver:
     enable_force: false      # master switch; normally set by the launch arg enable_force:=true
 
     map:
-      control_point: wrist   # "wrist": tilt bends the neck (natural). "tip": tilt pivots the whole arm about the tip
-      scale: 2.0             # arm moves 2 cm per 1 cm of stylus
+      scale: 2.0             # arm wrist moves 2 cm per 1 cm of stylus (tilt then bends the wrist)
       axis_signs: [-1.0, -1.0, 1.0]  # touch x (toward you), y (your right), z (up) -> arm x (out), y, z. Push in = arm forward
       stylus_axis: 0         # column of the Touch rotation matrix along the stylus (check at bring-up)
       pitch_gain: -1.0       # stylus tilt -> gripper tilt (flip the sign if it tilts the wrong way; 0 = gripper keeps its angle)
       roll_gain: 1.0         # stylus twist -> wrist_roll
 
     max_joint_speed: 2.0     # rad/s: the arm target never moves a joint faster than this (STS3215 ~4.7 rad/s)
-    max_force_N: 1.2         # Touch: 0.88 N rated continuous, 3.3 N peak. Hard cap 1.5. Don't lean on the wall for long
-    slew_N_per_s: 40.0       # hard cap 50. Higher = crisper contact onset
+    max_force_N: 2.5         # = hard cap. Touch: 0.88 N rated continuous, 3.3 N peak. Don't lean on the wall for long
+    slew_N_per_s: 200.0      # = hard cap. Higher = crisper contact onset (a 400 N/m wall hit at 0.3 m/s rises at 120 N/s)
     engage_ramp_s: 0.5
     velocity_lpf_hz: 30.0    # smooths the velocity used by damping (lower = smoother, but laggier)
-    free_damping: 0.3       # N/(m/s) while engaged. Hard cap 2.0
+    free_damping: 0.3        # N/(m/s) while engaged. Hard cap 4.0
 
-    wall:                    # a plane in the ARM frame (base_link), acts on the tool tip
-      enabled: true          # drawn + stops the arm; pushes only with enable_force:=true. Toggle with [w]
-      mode: proxy            # start mode ([c] switches). proxy: stop AT the wall. cbf: slow down BEFORE it
-      cbf_alpha: 5.0         # 1/s. CBF: approach speed <= alpha x distance (1 cm away -> 5 cm/s). [1]-[5] live
-      point: [0.0, 0.0, 0.01]  # the table is z = 0: 1 cm margin for the jaws + overshoot
+    # Virtual fixture after Bloom et al., IEEE ToH 2026: a plane in the ARM frame (base_link) on the tool tip
+    wall:
+      mode: impedance        # start mode, [c] cycles: off | impedance (eq. 9) | cbf (eq. 22-23)
+      filter_always: false   # [f] true = CBF filter on the arm in every mode (the paper's user study)
+      point: [0.0, 0.0, 0.015] # 1.5 cm above the table (z = 0)
       normal: [0.0, 0.0, 1.0]  # points to the FREE side
-      stiffness: 400.0       # N/m. Hard cap 400 (Touch max). Buzzes? raise damping first, then lower this
-      damping: 1.0           # N/(m/s). Hard cap 2.0
+      floor_below: 0.015     # m: hard floor (backstop) this far below the wall = the table. Not in the paper
+      stiffness: 400.0       # N/m, impedance wall. = hard cap (the Touch max; stiffer goes unstable)
+      damping: 2.5           # N/(m/s). Hard cap 4.0. Kills the bounce = feels harder. Buzzes? lower it
+      # CBF: arm chases the hand at u = K x gap (eq. 7); filter: approach <= alpha x height (eq. 14);
+      # force = D x speed removed (eq. 23). Force starts before the wall if K/alpha > 1 (eq. 35)
+      cbf_gain: 10.0         # K [1/s]. Up/Down live. 10 = 0.1 s lag
+      cbf_alpha: 3.33        # alpha [1/s]. Left/Right live, [1]-[5] = K/alpha 0.5/1/2/3/5. 3.33 -> K/alpha 3
+      cbf_damping: 40.0      # D [N s/m at the stylus]. Past the wall: feels like D x K (kept <= 400 N/m)
 
-    transient:               # "tap" on wall contact: decaying sinusoid, scaled by impact speed. Toggle with [t]
+    tracking:                # eq. 8 "rubber band": hand -> robot (real arm if heard, else the command). [h]
       enabled: true
-      gain: 4.0              # N per (m/s) into the wall. 0.1 m/s -> 0.4 N
-      freq_hz: 100.0         # 20-300. Lower = thud, higher = click
-      decay_s: 0.02          # 5-50 ms
-      max_N: 0.4             # hard cap 0.5
+      stiffness: 15.0        # N/m at the stylus (the paper's Kp)
 
     reach:                   # feel the arm's reach and joint limits
       enabled: true
       stiffness: 100.0
 
-    feedback:                # feel the follower lagging/blocked behind the target
-      enabled: false         # also toggled with [b] in the window
-      stiffness: 50.0
-      deadband_m: 0.01       # gaps smaller than this (normal tracking lag) are not felt
-      lpf_hz: 15.0
-      watchdog_s: 0.1        # follower states older than this are ignored
+    follower_watchdog_s: 0.1 # follower states older than this are ignored
 
     home: [0.0, -0.8, 0.8, 0.0, 0.0]  # ghost pose until the follower is heard (tool ~30 cm out, 22 cm up)

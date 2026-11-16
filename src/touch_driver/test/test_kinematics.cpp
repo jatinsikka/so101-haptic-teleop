@@ -139,25 +139,7 @@ int main() {
     if (norm(sub(res.reached, p.W)) > 1e-6 || dq > 1e-6) ++bad;
   }
   CHECK(bad == 0, "%d of %d poses: IK(FK(q).W) != q", bad, tested);
-  std::printf("IK round trip (wrist): %d poses\n", tested);
-
-  // 2b. same on the TOOL TIP (tip control)
-  tested = bad = 0;
-  for (int t = 0; t < 4000; ++t) {
-    const Arm5 q = rand_q(0.9);
-    const ArmPose p = forward(arm, q);
-    const double a0 = arm.c0 * q[0];
-    auto r_of = [&](const Vec3& v) { return (v[0] - arm.pan_x) * std::cos(a0) + (v[1] - arm.pan_y) * std::sin(a0); };
-    const double bend = wrap_angle(b2 + arm.c[2] * q[2] - b1);
-    if (r_of(p.W) < 0.03 || r_of(p.T) < 0.03 || bend * elbow_sign < 0.36) continue;
-    ++tested;
-    const IkResult res = inverse(arm, p.T, p.phi, q[4], Arm5{}, true);
-    double dq = 0;
-    for (int i = 0; i < 5; ++i) dq = std::max(dq, std::fabs(res.q[i] - q[i]));
-    if (norm(sub(res.reached, p.T)) > 1e-6 || dq > 1e-6) ++bad;
-  }
-  CHECK(bad == 0, "%d of %d poses: IK(FK(q).T) != q", bad, tested);
-  std::printf("IK round trip (tip): %d poses\n", tested);
+  std::printf("IK round trip: %d poses\n", tested);
 
   // 3. no flips: sweep the wrist target along a line through and beyond the workspace, 1 mm steps.
   //    Every joint must change smoothly (< 0.05 rad per mm) - this is what "erratic" looked like.

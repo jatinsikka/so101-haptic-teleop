@@ -1,7 +1,9 @@
 // Touch via CHAI3D: haptic loop + window. Structure from CHAI3D examples/GLFW/01-mydevice.
 //
 // Each 1 kHz tick: read_touch -> read_ros -> deadman -> update_target -> compute_force -> output
-// -> publish_state. Wall modes: PROXY (stop at contact) or CBF (slow down before it), key [c].
+// -> publish_state. Virtual fixture after Bloom et al., IEEE ToH 2026, key [c]:
+//   OFF (no fixture) | IMPEDANCE (spring on the hand past the wall) | CBF (filter stops the arm before
+//   the wall; force = D x speed removed). Plus the tracking force ("rubber band") in every mode.
 //
 // CHAI3D's Phantom driver does NOT clamp forces, check errors, or report calibration
 // (and getPosition() returns false on success). All safety is here + haptic_math.hpp:
@@ -9,7 +11,7 @@
 //   2. deadman: button 1 held, fresh press only
 //   3. engage ramp
 //   4. follower watchdog
-//   5. safe_force: NaN -> fault, clamp, slew. Contact tap: own caps (0.5 N, 0.1 s)
+//   5. safe_force: NaN -> fault, clamp, slew
 //   6. fault latch until /touch/clear_fault
 //   7. shutdown: zero force, stop loop, then close device
 // Pacing: setForce...() waits for the device's 1 kHz servo tick; no sleep needed.
@@ -139,18 +141,16 @@ struct HapticApp::Impl {
     Vec3 side0{1, 0, 0};
     double twist = 0, twist_prev = 0;
     Arm5 q_target{};           // rate-limited (what the arm is told)
-    Vec3 p_hand{}, p_proxy{}, p_reached{};  // control points (tip or wrist): hand, after wall, reached by q_target
+    // wrist points (arm frame): hand = where the stylus says; cmd = commanded point that chases the
+    // hand (eq. 7); proxy = cmd after the floor; ik = what the IK reaches; reached = q_target's
+    Vec3 p_hand{}, p_cmd{}, p_proxy{}, p_ik{}, p_reached{};
     Vec3 p_tool{};             // tool tip of q_target
-    Vec3 p_ik{};               // control point the IK can reach (before the rate limit)
     Vec3 v_filt{};             // low-passed stylus velocity (for damping)
-    double depth = 0;          // wall penetration of the tool tip (arm frame)
-    Vec3 p_safe{};             // CBF: arm target that slows down near the wall
-    double cbf_gap = 0;        // CBF: hand ahead of p_safe, toward the wall [m] (felt as a spring)
-    bool clamped = false;
-    Vec3 fb_filt{}, F_prev{};
-    bool was_in_wall = false;       // contact tap: trigger on entry
-    double tr_t = 1.0, tr_A = 0.0;  // seconds since the tap started, its amplitude
-    Vec3 tr_n{}, tr_vec{};          // tap direction, this tick's tap force (touch frame)
+    double hand_depth = 0;     // how far the hand's tip is past the wall [m, arm side] (impedance force)
+    double cbf_removed = 0;    // speed the CBF filter removed toward the wall [m/s, arm side] (CBF force)
+    bool filter_on = false, at_floor = false, clamped = false;
+    double f_wall = 0, f_cbf = 0, f_track = 0;  // force components [N], for the window
+    Vec3 F_prev{};
     double rate_hz = 0;
     std::uint64_t ticks = 0;
   } L;
@@ -177,8 +177,6 @@ struct HapticApp::Impl {
 
   Impl(Shared& s, const Config& c, const PlanarArm& a, const RobotModel& m) : shared(s), cfg(c), arm(a), model(m) {}
 
-  const Vec3& ctrl(const ArmPose& p) const { return control_point(p, cfg.tip_control); }
-
   // ================================================================ haptic loop
   static void trampoline(void* self) { static_cast<Impl*>(self)->haptic_loop(); }
 
@@ -186,7 +184,7 @@ struct HapticApp::Impl {
     finished = false;
     L.map = cfg.map;
     L.q_target = cfg.home;
-    L.p_hand = L.p_proxy = L.p_reached = ctrl(forward(arm, L.q_target));
+    L.p_hand = L.p_cmd = L.p_proxy = L.p_reached = forward(arm, L.q_target).W;
     Clock::time_point t_prev = Clock::now(), t_rate = t_prev;
     std::uint64_t ticks_at_rate = 0;
 
@@ -267,26 +265,25 @@ struct HapticApp::Impl {
         for (int i = 0; i < 5; ++i) L.q_target[i] = clamp(L.in.q_follower[i], arm.lo[i], arm.hi[i]);
       const ArmPose ap = forward(arm, L.q_target);
       L.map.touch_anchor = r.p;
-      L.map.arm_anchor = ctrl(ap);  // the hand drives the gripper tip (or wrist point)
+      L.map.arm_anchor = ap.W;  // the hand drives the wrist point
       L.pitch0 = stylus_pitch(r.axis);
       L.phi0 = ap.phi;
       L.roll0 = L.q_target[4];
       L.side0 = r.side;
       L.twist = L.twist_prev = 0.0;
-      L.fb_filt = {0, 0, 0};
     }
   }
 
-  // 4. arm target: map -> [CBF] -> IK -> proxy wall (on the tool tip) -> rate limit.
+  // 4. arm target, the paper's Fig. 4 (with our analytic IK in place of its IK QP):
+  //    hand -> tracking u = K (hand - cmd) -> [CBF filter] -> integrate -> floor -> IK -> rate limit.
   //    Not engaged: ghost sits on the real arm.
   void update_target(const Reading& r, double dt) {
-    L.depth = 0.0;
-    L.cbf_gap = 0.0;
-    L.clamped = false;
+    L.hand_depth = L.cbf_removed = 0.0;
+    L.filter_on = L.at_floor = L.clamped = false;
     if (!L.engaged) {
       if (L.follower_live) L.q_target = L.in.q_follower;
       const ArmPose ap = forward(arm, L.q_target);
-      L.p_hand = L.p_proxy = L.p_reached = L.p_ik = L.p_safe = ctrl(ap);
+      L.p_hand = L.p_cmd = L.p_proxy = L.p_reached = L.p_ik = ap.W;
       L.p_tool = ap.T;
       return;
     }
@@ -296,32 +293,39 @@ struct HapticApp::Impl {
     const double phi = L.phi0 + cfg.pitch_gain * (stylus_pitch(r.axis) - L.pitch0);
     const double roll = L.roll0 + cfg.roll_gain * L.twist;
 
-    L.p_hand = touch_to_arm(L.map, r.p);  // desired control point
-    L.p_proxy = L.p_hand;
+    const FixtureMode mode = static_cast<FixtureMode>(shared.mode.load());
+    const Vec3& n = cfg.wall.normal;
+    const ArmPose now = forward(arm, L.q_target);
+    const Vec3 to_tip = sub(now.T, now.W);  // we steer the wrist point; the wall acts on the TIP
+    L.p_hand = touch_to_arm(L.map, r.p);    // desired wrist point
 
-    // CBF mode: the target follows the hand but may approach the wall only at alpha x distance.
-    // The wall acts on the TIP, so shift it by the current control point -> tip offset.
-    if (shared.wall_on && shared.cbf_on) {
-      const ArmPose now = forward(arm, L.q_target);
-      Wall w = cfg.wall;
-      w.point = sub(cfg.wall.point, sub(now.T, ctrl(now)));
-      L.p_safe = cbf_step(w, shared.cbf_alpha.load(), L.p_safe, L.p_hand, clamp(dt, 0.0, 0.002));
-      L.p_proxy = L.p_safe;
-      L.cbf_gap = std::max(0.0, dot(sub(L.p_safe, L.p_hand), cfg.wall.normal));  // hand ahead of the arm
-    } else {
-      L.p_safe = L.p_hand;  // switching to CBF later starts from the hand
+    // a. tracking (eq. 7): the commanded point chases the hand
+    Vec3 u = mul(shared.cbf_gain.load(), sub(L.p_hand, L.p_cmd));
+
+    // b. CBF filter (eq. 16, 26, 29): in CBF mode, or in every mode with [f]
+    L.filter_on = mode == FixtureMode::kCbf || shared.filter_always;
+    if (L.filter_on) {
+      const double h = dot(sub(add(L.p_cmd, to_tip), cfg.wall.point), n);  // tip height above the wall
+      const CbfResult c = cbf_filter(n, h, u, shared.cbf_alpha.load());
+      u = c.u_safe;
+      L.cbf_removed = c.removed;  // -> CBF force (eq. 23), step 5
     }
+    L.p_cmd = add(L.p_cmd, mul(clamp(dt, 0.0, 0.002), u));
 
-    // Proxy wall: in proxy mode this IS the wall; in CBF mode a backstop that should never act.
-    // If the tip would be inside, lift the whole tool back to the surface.
-    IkResult ik = inverse(arm, L.p_proxy, phi, roll, L.q_target, cfg.tip_control);
-    if (shared.wall_on) {
-      const WallProxy wp = wall_proxy(cfg.wall, forward(arm, ik.q).T);
-      if (wp.depth > 0.0) {
-        L.depth = wp.depth;
-        L.p_proxy = add(L.p_proxy, mul(wp.depth, cfg.wall.normal));
-        ik = inverse(arm, L.p_proxy, phi, roll, L.q_target, cfg.tip_control);
-      }
+    // c. impedance wall (eq. 10): how far the HAND's tip is past the wall. Force only (step 5).
+    L.hand_depth = std::max(0.0, dot(sub(cfg.wall.point, add(L.p_hand, to_tip)), n));
+
+    // d. floor backstop, every mode: the commanded tip never goes below the table (floor_below
+    //    under the wall). Not part of the paper: it only protects the gripper in OFF/IMPEDANCE.
+    Wall floor = cfg.wall;
+    floor.point = sub(cfg.wall.point, mul(cfg.floor_below, n));
+    L.p_proxy = L.p_cmd;
+    IkResult ik = inverse(arm, L.p_proxy, phi, roll, L.q_target);
+    const WallProxy wp = wall_proxy(floor, forward(arm, ik.q).T);
+    if (wp.depth > 0.0) {
+      L.at_floor = true;
+      L.p_proxy = L.p_cmd = add(L.p_cmd, mul(wp.depth, n));  // also move cmd: no wind-up below the floor
+      ik = inverse(arm, L.p_proxy, phi, roll, L.q_target);
     }
     L.clamped = ik.clamped;
     L.p_ik = ik.reached;
@@ -330,7 +334,7 @@ struct HapticApp::Impl {
     const double step = cfg.max_joint_speed * clamp(dt, 0.0, 0.002);
     for (int i = 0; i < 5; ++i) L.q_target[i] += clamp(ik.q[i] - L.q_target[i], -step, step);
     const ArmPose ap = forward(arm, L.q_target);
-    L.p_reached = ctrl(ap);
+    L.p_reached = ap.W;
     L.p_tool = ap.T;
   }
 
@@ -339,69 +343,54 @@ struct HapticApp::Impl {
     const double dtc = clamp(dt, 1e-4, 0.002);
     // velocity estimate is noisy; noise x damping = "sandpaper". Low-pass it first.
     L.v_filt = add(L.v_filt, mul(lowpass_alpha(cfg.velocity_lpf_hz, dtc), sub(r.v, L.v_filt)));
-    L.tr_vec = {0, 0, 0};
-    L.tr_t += dtc;
-    if (!L.engaged) {
-      L.was_in_wall = false;
-      return {0, 0, 0};
-    }
+    if (!L.engaged) return {0, 0, 0};
     const Vec3& v = L.v_filt;
     const Vec3 n = arm_dir_to_touch(L.map, cfg.wall.normal);  // wall normal, touch frame
-    Vec3 F = mul(-cfg.free_damping, v);    // damping
+    const FixtureMode mode = static_cast<FixtureMode>(shared.mode.load());
+    L.f_wall = L.f_cbf = L.f_track = 0.0;
+    Vec3 F = mul(-cfg.free_damping, v);  // light damping everywhere
 
-    // wall: spring-damper on how far the hand is past the arm target, along the wall normal.
-    //   proxy: depth = hand inside the wall (felt only after contact)
-    //   CBF:   + cbf_gap = hand ahead of the slowed target (felt BEFORE contact, when too fast)
-    const double wall_depth = L.depth + L.cbf_gap;
-    if (wall_depth > 0.0)
-      F = add(F, mul(wall_force_mag(cfg.wall.stiffness, cfg.wall.damping, wall_depth / L.map.scale, dot(v, n)), n));
-
-    // contact tap: decaying sinusoid along the normal, scaled by impact speed. Once per entry.
-    const bool in_wall = L.depth > 0.0;
-    if (shared.transient_on) {
-      if (in_wall && !L.was_in_wall && L.tr_t > kHardMaxTransient_s) {
-        L.tr_t = 0.0;
-        L.tr_A = transient_amplitude(cfg.transient, std::max(0.0, -dot(v, n)));  // speed INTO the wall
-        L.tr_n = n;
-      }
-      L.tr_vec = mul(transient_value(cfg.transient, L.tr_A, L.tr_t), L.tr_n);
+    // impedance wall (eq. 9, IMPEDANCE mode): spring-damper on how far the hand is past the wall.
+    // Felt only after the hand crosses it; the arm itself is not stopped.
+    if (mode == FixtureMode::kImpedance && L.hand_depth > 0.0) {
+      L.f_wall = wall_force_mag(cfg.wall.stiffness, cfg.wall.damping, L.hand_depth / L.map.scale, dot(v, n));
+      F = add(F, mul(L.f_wall, n));
     }
-    L.was_in_wall = in_wall;
+
+    // CBF force (eq. 23, CBF mode): D x (speed the filter removed), along the wall normal.
+    // Felt as damping when you come in too fast, and as the wall once you push past it.
+    // Arm speed / scale = the same speed at the stylus. + wall damping, never pulls.
+    if (mode == FixtureMode::kCbf && L.cbf_removed > 0.0) {
+      const double D = cbf_damping_capped(cfg.cbf_damping, shared.cbf_gain.load());
+      L.f_cbf = wall_force_mag(D, cfg.wall.damping, L.cbf_removed / L.map.scale, dot(v, n));
+      F = add(F, mul(L.f_cbf, n));
+    }
+
+    // tracking force (eq. 8, all modes, [h]): rubber band from the hand to the robot, so you feel
+    // where the arm is and how far behind it lags. Robot = the real arm if heard, else the command.
+    if (shared.tracking_on) {
+      const Vec3 robot = L.follower_live ? forward(arm, L.in.q_follower).W : L.p_reached;
+      const Vec3 Ft = mul(cfg.tracking_stiffness, arm_delta_to_touch(L.map, sub(robot, L.p_hand)));
+      L.f_track = norm(Ft);
+      F = add(F, Ft);
+    }
+
     // reach / joint limits: only where the IK itself can't go (not the rate-limit lag, which steps every tick)
     if (cfg.reach_enabled)
       F = add(F, mul(cfg.reach_stiffness, arm_delta_to_touch(L.map, sub(L.p_ik, L.p_proxy))));
 
-    Vec3 fb{0, 0, 0};                      // follower feedback (deadband, low-pass)
-    if (shared.feedback_on && L.follower_live) {
-      const Vec3 e = sub(ctrl(forward(arm, L.in.q_follower)), L.p_reached);  // same point on both arms
-      const double m = norm(e);
-      if (m > cfg.feedback_deadband_m)
-        fb = mul(cfg.feedback_stiffness, arm_delta_to_touch(L.map, mul((m - cfg.feedback_deadband_m) / m, e)));
-    }
-    L.fb_filt = add(L.fb_filt, mul(lowpass_alpha(cfg.feedback_lpf_hz, dtc), sub(fb, L.fb_filt)));
-    F = add(F, L.fb_filt);
-
     L.ramp = std::min(1.0, L.ramp + dt / cfg.engage_ramp_s);  // engage ramp
-    L.tr_vec = mul(L.ramp, L.tr_vec);
     return mul(L.ramp, F);
   }
 
   // 6. safety filter -> device. Dropping to zero is not slew-limited (can't kick).
-  //    The contact tap is added AFTER the slew limit (100 Hz needs fast changes): it is bounded by
-  //    its own caps (0.5 N, 0.1 s) and the total by max_force + tap max (<= hard cap 1.5 N).
   Vec3 output(const Vec3& F, double dt) {
     Vec3 out{0, 0, 0};
     if (cfg.enable_force && L.engaged && !L.fault && !safe_force(F, L.F_prev, cfg.max_force_N, cfg.slew_N_per_s, dt, out))
       latch(Fault::kBadForce);  // out is zero
-    L.F_prev = out;  // the slew limit tracks the steady force only
-    Vec3 sent = out;
-    if (cfg.enable_force && L.engaged && !L.fault) {
-      const Vec3 total = add(out, L.tr_vec);
-      const double cap = std::min(cfg.max_force_N + std::min(cfg.transient.max_N, kHardMaxTransient_N), kHardMaxForce_N);
-      if (finite(total)) sent = norm(total) > cap ? mul(cap / norm(total), total) : total;
-    }
-    device->setForceAndTorqueAndGripperForce(cv(sent), kZero, 0.0);  // blocks until servo tick
-    return sent;
+    L.F_prev = out;
+    device->setForceAndTorqueAndGripperForce(cv(out), kZero, 0.0);  // blocks until servo tick
+    return out;
   }
 
   // 7. snapshot for ROS + graphics (try_lock: never wait).
@@ -414,14 +403,18 @@ struct HapticApp::Impl {
     s.fault = L.fault;
     s.fault_reason = L.reason;
     s.follower_live = L.follower_live;
-    s.in_wall = L.depth > 0.0;
     s.clamped = L.clamped;
-    s.wall_on = shared.wall_on;
-    s.feedback_on = shared.feedback_on;
-    s.transient_on = shared.transient_on;
-    s.cbf_on = shared.cbf_on;
-    s.cbf_gap = L.cbf_gap;
+    s.mode = static_cast<FixtureMode>(shared.mode.load());
+    s.filter_on = L.filter_on;
+    s.tracking_on = shared.tracking_on;
+    s.hand_in_wall = L.hand_depth > 0.0;
+    s.at_floor = L.at_floor;
+    s.cbf_removed = L.cbf_removed;
+    s.cbf_gain = shared.cbf_gain.load();
     s.cbf_alpha = shared.cbf_alpha.load();
+    s.f_wall = L.f_wall;
+    s.f_cbf = L.f_cbf;
+    s.f_track = L.f_track;
     s.force = F_out;
     s.pitch = stylus_pitch(r.axis);
     s.twist = L.twist;
@@ -514,8 +507,8 @@ struct HapticApp::Impl {
     toast = new cLabel(big_font);
     toast->setShowEnabled(false);
     camera->m_frontLayer->addChild(toast);
-    help->setText("button 1 = engage  |  [c] CBF/proxy  [w] wall  [t] tap  [b] feedback (released)  |  "
-                  "[1]-[5] alpha 2/5/10/20/50 (anytime)  |  [q] quit");
+    help->setText("button 1 = engage  |  released: [c] mode OFF/IMPEDANCE/CBF  [f] filter always  [h] rubber band  |  "
+                  "anytime: Up/Down K  Left/Right alpha  [1]-[5] K/alpha 0.5/1/2/3/5  |  [q] quit");
   }
 
   void update_scene() {
@@ -532,27 +525,25 @@ struct HapticApp::Impl {
       ghost.update(arm, s.q_target, true);
       follower.update(arm, s.q_follower, s.follower_live);
     }
-    // draw the hand at the TIP it commands: in wrist mode, shift by the arm's wrist->tip vector
-    const Vec3 to_tip = sub(s.p_tool, s.p_reached);  // zero in tip mode
-    const Vec3 hand_tip = add(s.p_hand, to_tip);
+    // draw the hand at the TIP it commands: shift the wrist point by the arm's wrist->tip vector
+    const Vec3 hand_tip = add(s.p_hand, sub(s.p_tool, s.p_reached));
     hand->setLocalPos(cv(hand_tip));
     hand->setShowEnabled(s.engaged);
     tool->setLocalPos(cv(s.p_tool));
-    if (s.in_wall)
+    if (s.hand_in_wall || s.at_floor)
       tool->m_material->setColorf(1.0f, 0.3f, 0.3f);
     else
       tool->m_material->setColorf(0.35f, 0.75f, 1.0f);
-    spring->m_pointA = cv(hand_tip);
+    spring->m_pointA = cv(hand_tip);  // the "rubber band": hand -> arm
     spring->m_pointB = cv(s.p_tool);
     spring->setShowEnabled(s.engaged);
     force_arrow->m_pointA = cv(s.p_tool);  // arm frame, 10 cm/N
     force_arrow->m_pointB = cv(add(s.p_tool, mul(0.10, touch_dir_to_arm(cfg.map, s.force))));
     force_arrow->setShowEnabled(norm(s.force) > 1e-3);
-    wall_mesh->setShowEnabled(s.wall_on);
-    if (s.cbf_on)  // the wall's color says the mode: blue = CBF, red = proxy
-      wall_mesh->m_material->setColorf(0.25f, 0.55f, 1.0f);
-    else
-      wall_mesh->m_material->setColorf(0.9f, 0.3f, 0.3f);
+    float rgb[3];  // the wall's color says the mode: grey = OFF, red = IMPEDANCE, blue = CBF
+    mode_color(s.mode, rgb);
+    wall_mesh->m_material->setColorf(rgb[0], rgb[1], rgb[2]);
+    wall_mesh->setTransparencyLevel(s.mode == FixtureMode::kOff ? 0.12f : 0.35f);
 
     std::ostringstream st;
     st.setf(std::ios::fixed);
@@ -560,8 +551,9 @@ struct HapticApp::Impl {
     if (s.fault)
       st << "FAULT: " << fault_name(s.fault_reason) << "  (release button 1, ros2 service call /touch/clear_fault std_srvs/srv/Trigger)";
     else if (s.engaged)
-      st << "ENGAGED" << (cfg.enable_force ? "" : " (forces disabled)") << (s.in_wall ? "  IN WALL" : "")
-         << (s.cbf_gap > 0.001 ? "  CBF BRAKING" : "") << (s.clamped ? "  AT REACH/JOINT LIMIT" : "");
+      st << "ENGAGED" << (cfg.enable_force ? "" : " (forces disabled)") << (s.hand_in_wall ? "  HAND PAST WALL" : "")
+         << (s.cbf_removed > 0.001 ? "  CBF ACTIVE" : "") << (s.at_floor ? "  AT FLOOR" : "")
+         << (s.clamped ? "  AT REACH/JOINT LIMIT" : "");
     else
       st << (cfg.enable_force ? "free: press button 1 to engage" : "read-only (forces disabled): press button 1 to move the ghost");
     st << "   |  haptics " << s.rate_hz << " Hz  graphics " << graphics_rate.getFrequency() << " Hz";
@@ -570,19 +562,15 @@ struct HapticApp::Impl {
     std::ostringstream nf;
     nf.setf(std::ios::fixed);
     nf.precision(3);
-    nf << "force " << norm(s.force) << " N   pitch " << s.pitch << "  twist " << s.twist << " rad   follower "
-       << (s.follower_live ? "live" : "not heard") << "   wall " << (s.wall_on ? "on" : "off") << "   tap "
-       << (s.transient_on ? "on" : "off") << "   feedback "
-       << (s.feedback_on ? "on" : "off");
+    nf.precision(2);
+    nf << "force " << norm(s.force) << " N  (wall " << s.f_wall << "  CBF " << s.f_cbf << "  rubber band " << s.f_track
+       << (s.tracking_on ? "" : " off") << ")   follower " << (s.follower_live ? "live" : "not heard");
     info->setText(nf.str());
 
-    // Banner: the wall mode, always, in the wall's color (+ a warning if forces are off).
-    banner->setText(std::string(cfg.enable_force ? "" : "FORCES OFF (read-only)  |  ") + "WALL MODE: " +
-                    mode_text(s.cbf_on, s.cbf_alpha));
-    if (s.cbf_on)
-      banner->m_fontColor.set(0.45f, 0.7f, 1.0f);
-    else
-      banner->m_fontColor.set(1.0f, 0.45f, 0.45f);
+    // Banner: the mode and its parameters, always, in the wall's color (+ a warning if forces are off).
+    banner->setText(std::string(cfg.enable_force ? "" : "FORCES OFF (read-only)  |  ") +
+                    mode_text(s.mode, s.cbf_gain, s.cbf_alpha, shared.filter_always));
+    banner->m_fontColor.set(std::min(1.0f, rgb[0] + 0.2f), std::min(1.0f, rgb[1] + 0.2f), std::min(1.0f, rgb[2] + 0.2f));
     banner->setShowEnabled(true);
 
     const int h = viewport ? viewport->getDisplayHeight() : 600;
@@ -595,27 +583,50 @@ struct HapticApp::Impl {
     toast->setLocalPos(static_cast<int>((wd - toast->getWidth()) / 2), static_cast<int>(h * 0.62));
   }
 
-  // "CBF  alpha 5/s ..." or "PROXY ...": one wording for the banner, the pop-up and the terminal.
-  static std::string mode_text(bool cbf, double alpha) {
+  static void mode_color(FixtureMode m, float rgb[3]) {
+    const float grey[3] = {0.6f, 0.6f, 0.6f}, red[3] = {0.9f, 0.3f, 0.3f}, blue[3] = {0.25f, 0.55f, 1.0f};
+    const float* c = m == FixtureMode::kOff ? grey : m == FixtureMode::kImpedance ? red : blue;
+    for (int i = 0; i < 3; ++i) rgb[i] = c[i];
+  }
+
+  // One wording for the banner, the pop-up and the terminal. "When the CBF force starts" is eq. 35.
+  static std::string mode_text(FixtureMode m, double K, double alpha, bool filter_always) {
     std::ostringstream t;
     t.setf(std::ios::fixed);
-    t.precision(0);
-    if (cbf)
-      t << "CBF   alpha " << alpha << "/s  (1 cm away -> max " << alpha << " cm/s, brakes BEFORE contact)";
-    else
-      t << "PROXY  (stops only AT contact)";
+    t.precision(1);
+    t << "MODE: " << mode_name(m);
+    if (m == FixtureMode::kOff) t << "  (no fixture: the arm can hit the table)";
+    if (m == FixtureMode::kImpedance) t << "  (spring once your hand passes the wall; the arm is NOT stopped)";
+    if (m == FixtureMode::kCbf || filter_always) {
+      const double ratio = K / alpha;
+      t << "   |  CBF filter: K " << K << "/s  alpha " << alpha << "/s  K/alpha " << ratio;
+      if (m == FixtureMode::kCbf) {
+        t << ": force ";
+        if (ratio > 1.0 + 1e-6)
+          t << "BEFORE the wall if you come in too fast";
+        else if (ratio > 1.0 - 1e-6)
+          t << "AT the wall";
+        else
+          t << "only PAST the wall";
+      } else {
+        t << " (filter always on)";
+      }
+    }
     return t.str();
   }
 
   // Big message for 2 s + the same line in the terminal.
-  void announce(const std::string& text, bool cbf) {
+  void announce(const std::string& text) {
     toast->setText(text);
-    if (cbf)
-      toast->m_fontColor.set(0.45f, 0.7f, 1.0f);
-    else
-      toast->m_fontColor.set(1.0f, 0.45f, 0.45f);
+    float rgb[3];
+    mode_color(static_cast<FixtureMode>(shared.mode.load()), rgb);
+    toast->m_fontColor.set(std::min(1.0f, rgb[0] + 0.2f), std::min(1.0f, rgb[1] + 0.2f), std::min(1.0f, rgb[2] + 0.2f));
     toast_until = Clock::now() + std::chrono::seconds(2);
     std::printf("[touch] %s\n", text.c_str());
+  }
+  void announce_mode() {
+    announce(mode_text(static_cast<FixtureMode>(shared.mode.load()), shared.cbf_gain, shared.cbf_alpha,
+                       shared.filter_always));
   }
 
   static void on_key(GLFWwindow* w, int key, int, int action, int) {
@@ -625,36 +636,41 @@ struct HapticApp::Impl {
       glfwSetWindowShouldClose(w, GLFW_TRUE);
       return;
     }
-    // [1]-[5]: CBF alpha presets. Allowed while engaged: alpha only changes the speed limit,
-    // the target still moves continuously, so the force can't step.
-    static const double kAlpha[5] = {2.0, 5.0, 10.0, 20.0, 50.0};
-    if (key >= GLFW_KEY_1 && key <= GLFW_KEY_5) {
-      const double a = kAlpha[key - GLFW_KEY_1];
-      self->shared.cbf_alpha = a;
-      const bool cbf = self->shared.cbf_on;
-      if (cbf)
-        self->announce("MODE: " + mode_text(true, a), true);
-      else  // alpha only matters in CBF mode: say so
-        self->announce("MODE: PROXY  (alpha " + std::to_string(static_cast<int>(a)) + "/s set, used in CBF: press [c])",
-                       false);
+    Shared& sh = self->shared;
+
+    // Anytime (even engaged): CBF parameters. They only change the filter's speed limit; the force
+    // still goes through the slew limit, so it can't kick.
+    //   Up/Down: K x/÷ 1.25.  Left/Right: alpha ÷/x 1.25.  [1]-[5]: K/alpha presets (alpha = K/ratio).
+    static const double kRatio[5] = {0.5, 1.0, 2.0, 3.0, 5.0};
+    const double K = sh.cbf_gain, a = sh.cbf_alpha;
+    bool cbf_param = true;
+    if (key == GLFW_KEY_UP) sh.cbf_gain = clamp(K * 1.25, 1.0, 30.0);
+    else if (key == GLFW_KEY_DOWN) sh.cbf_gain = clamp(K / 1.25, 1.0, 30.0);
+    else if (key == GLFW_KEY_RIGHT) sh.cbf_alpha = clamp(a * 1.25, 0.5, 100.0);  // alpha dt <= 1 keeps the guarantee
+    else if (key == GLFW_KEY_LEFT) sh.cbf_alpha = clamp(a / 1.25, 0.5, 100.0);
+    else if (key >= GLFW_KEY_1 && key <= GLFW_KEY_5) sh.cbf_alpha = clamp(K / kRatio[key - GLFW_KEY_1], 0.5, 100.0);
+    else cbf_param = false;
+    if (cbf_param) {
+      self->announce_mode();
       return;
     }
-    std::atomic<bool>* flag = nullptr;
-    const char* what = "";
-    if (key == GLFW_KEY_W) flag = &self->shared.wall_on, what = "wall";
-    if (key == GLFW_KEY_B) flag = &self->shared.feedback_on, what = "follower feedback";
-    if (key == GLFW_KEY_T) flag = &self->shared.transient_on, what = "contact tap";
-    if (key == GLFW_KEY_C) flag = &self->shared.cbf_on, what = "CBF wall (off = proxy wall)";
-    if (!flag) return;
-    if (self->engaged_now) {  // toggling while engaged could step the force
-      self->announce("release button 1 first", self->shared.cbf_on);
+
+    // Only while released (switching mid-contact could step the force).
+    if (key != GLFW_KEY_C && key != GLFW_KEY_F && key != GLFW_KEY_H) return;
+    if (self->engaged_now) {
+      self->announce("release button 1 first");
       return;
     }
-    *flag = !*flag;
-    if (key == GLFW_KEY_C)
-      self->announce("MODE: " + mode_text(*flag, self->shared.cbf_alpha), *flag);
-    else
-      std::printf("[touch] %s %s\n", what, *flag ? "ON" : "OFF");
+    if (key == GLFW_KEY_C) {  // OFF -> IMPEDANCE -> CBF -> OFF
+      sh.mode = (sh.mode + 1) % 3;
+      self->announce_mode();
+    } else if (key == GLFW_KEY_F) {
+      sh.filter_always = !sh.filter_always;
+      self->announce(std::string("CBF filter in every mode: ") + (sh.filter_always ? "ON" : "OFF"));
+    } else {
+      sh.tracking_on = !sh.tracking_on;
+      self->announce(std::string("rubber band (tracking force): ") + (sh.tracking_on ? "ON" : "OFF"));
+    }
   }
   static void on_fb_size(GLFWwindow* w, int width, int height) {
     auto* self = static_cast<Impl*>(glfwGetWindowUserPointer(w));
@@ -738,10 +754,10 @@ bool HapticApp::open(std::string& info) {
 
 void HapticApp::run(const std::function<bool()>& keep_running) {
   Impl& m = *impl_;
-  m.shared.wall_on = m.cfg.wall_enabled;
-  m.shared.feedback_on = m.cfg.feedback_enabled;
-  m.shared.transient_on = m.cfg.transient.enabled;
-  m.shared.cbf_on = m.cfg.cbf_mode;
+  m.shared.mode = static_cast<int>(m.cfg.mode);
+  m.shared.filter_always = m.cfg.filter_always;
+  m.shared.tracking_on = m.cfg.tracking_enabled;
+  m.shared.cbf_gain = m.cfg.cbf_gain;
   m.shared.cbf_alpha = m.cfg.cbf_alpha;
   if (!m.open_window()) {
     std::fprintf(stderr, "[touch] could not open the window (OpenGL/GLFW)\n");

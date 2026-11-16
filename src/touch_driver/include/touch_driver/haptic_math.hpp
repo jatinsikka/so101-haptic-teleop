@@ -17,13 +17,11 @@ using Arm5 = std::array<double, 5>;  // pan, lift, elbow, wrist_flex, wrist_roll
 constexpr double kPi = 3.14159265358979323846;  // M_PI isn't standard C++
 
 // Hard caps. Compiled in so the YAML can only go lower.
-// Touch: 3.3 N peak, 0.88 N continuous, ~400 N/m, ~4 N/(m/s).
-constexpr double kHardMaxForce_N = 1.5;
-constexpr double kHardMaxStiffness_N_per_m = 400;  // CHAI3D's spec for the Touch
-constexpr double kHardMaxDamping_Ns_per_m = 2.0;
-constexpr double kHardMaxSlew_N_per_s = 50.0;
-constexpr double kHardMaxTransient_N = 0.5;   // contact vibration peak
-constexpr double kHardMaxTransient_s = 0.1;   // contact vibration length
+// Touch (CHAI3D spec): 3.3 N peak, 0.88 N continuous, 400 N/m, 4 N/(m/s).
+constexpr double kHardMaxForce_N = 2.5;               // short presses only (0.88 N continuous)
+constexpr double kHardMaxStiffness_N_per_m = 400;  // the Touch max: stiffer goes unstable
+constexpr double kHardMaxDamping_Ns_per_m = 4.0;
+constexpr double kHardMaxSlew_N_per_s = 200.0;  // 0 -> 2.5 N in 12 ms: a crisp contact onset
 
 // ---- vectors
 inline double clamp(double x, double lo, double hi) { return std::min(std::max(x, lo), hi); }
@@ -74,10 +72,10 @@ inline double twist_about(const Vec3& a, const Vec3& b0, const Vec3& b) {
   return std::atan2(dot(a, cross(p0, p1)), dot(p0, p1));
 }
 
-// ---- 3. virtual wall (plane in the arm frame) with a proxy
+// ---- 3. virtual wall (plane in the arm frame)
 // depth = (point - p) . n          > 0: inside (n points to free space)
-// proxy = p + depth * n            closest surface point; the arm is sent HERE, never inside
-// f     = max(0, k*depth - b*v_n)  felt at the stylus; never pulls
+// proxy = p + depth * n            closest surface point (used by the floor backstop)
+// f     = max(0, k*depth - b*v_n)  impedance force, felt at the stylus; never pulls
 // Damper needed: a sampled spring adds energy each bounce (passive if b > k*T/2).
 struct Wall {
   Vec3 point{0.0, 0.0, 0.05};
@@ -104,40 +102,33 @@ inline double wall_force_mag(double k, double b, double depth_touch, double v_no
   return std::max(0.0, k * depth_touch - b * v_normal);
 }
 
-// ---- contact transient (event-based haptics): on wall entry, a decaying sinusoid along the normal
-// a(t) = A e^(-t/decay) sin(2 pi f t), A = gain * impact speed (capped). Felt as a crisp "tap".
-// A spring alone feels soft on impact; real hard contact rings briefly.
-struct Transient {
-  bool enabled = true;
-  double gain = 4.0;      // N per (m/s) of impact speed at the stylus
-  double freq_hz = 100.0;
-  double decay_s = 0.02;
-  double max_N = 0.4;     // hard cap kHardMaxTransient_N
+// ---- CBF wall: Bloom et al., "Haptic virtual fixtures for telemanipulation using CBFs", IEEE ToH 2026
+// The arm target x chases the hand, filtered so it can't cross the wall:
+//   tracking  (eq. 7):   u = K (x_hand - x)              K = tracking gain [1/s]
+//   barrier   (eq. 16):  h = n . (x_tip - wall.point)    height above the wall, safe while h >= 0
+//   CBF       (eq. 14):  n . u* >= -alpha h              approach at most alpha x height
+//   closed form (eq. 26, 29), one wall:  Psi = n . u + alpha h
+//       Psi >= 0: u* = u            (safe: untouched)
+//       Psi <  0: u* = u - Psi n    (only the part INTO the wall is cut; sideways stays free)
+//   force     (eq. 23, 32): F = D (u* - u) = -D Psi n    felt as damping when you come in too fast
+// When does the force start? (eq. 35) ratio K/alpha > 1: BEFORE the hand reaches the wall
+//   (if it comes in too fast); = 1: AT the wall; < 1: only once the hand is PAST it.
+// Never crosses in discrete time: h_next >= (1 - alpha dt) h >= 0 while alpha dt <= 1.
+struct CbfResult {
+  Vec3 u_safe{};        // u*, the filtered velocity
+  double removed = 0;   // -Psi when active (speed removed along n, >= 0), else 0
 };
 
-inline double transient_amplitude(const Transient& c, double v_in) {
-  return clamp(c.gain * v_in, 0.0, std::min(c.max_N, kHardMaxTransient_N));
+inline CbfResult cbf_filter(const Vec3& n, double h, const Vec3& u, double alpha) {
+  const double psi = dot(n, u) + alpha * h;
+  if (psi >= 0.0) return {u, 0.0};
+  return {sub(u, mul(psi, n)), -psi};
 }
 
-// ---- CBF wall (control barrier function): the alternative to the proxy wall
-// h(x) = n . (x - wall.point)    distance above the wall. Safe set: h >= 0.
-// Rule:  dh/dt >= -alpha * h      approach the wall at most alpha x distance:
-//          far: no limit. 1 cm away, alpha 10/s: max 10 cm/s. At the wall: 0.
-// Each tick the safe point moves toward the hand. If that breaks the rule, only the part of the
-// step INTO the wall is cut (closed form of the 1-constraint QP). Sideways and away: untouched.
-// Never crosses: h_next >= (1 - alpha*dt) * h >= 0 while alpha*dt <= 1.
-inline Vec3 cbf_step(const Wall& w, double alpha, const Vec3& safe, const Vec3& desired, double dt) {
-  const double h = dot(sub(safe, w.point), w.normal);            // distance above the wall now
-  const double into = dot(sub(desired, safe), w.normal);         // this step along n (< 0 = toward)
-  const double allowed = -alpha * std::max(h, 0.0) * dt;        // most we may move toward it
-  if (into >= allowed) return desired;                           // rule holds: follow the hand
-  return add(desired, mul(allowed - into, w.normal));            // cut the normal part only
-}
-
-// t = seconds since contact. Zero outside [0, min(5 decays, hard cap)].
-inline double transient_value(const Transient& c, double amplitude, double t) {
-  if (t < 0.0 || t > std::min(5.0 * c.decay_s, kHardMaxTransient_s)) return 0.0;
-  return amplitude * std::exp(-t / c.decay_s) * std::sin(2.0 * kPi * c.freq_hz * t);
+// Past the wall the CBF removes all of u = K x gap, so its force acts like a spring of stiffness D x K.
+// K is changed live: keep D x K under the wall's hard cap whatever K is.
+inline double cbf_damping_capped(double D, double K) {
+  return std::min(D, kHardMaxStiffness_N_per_m / std::max(K, 1e-6));
 }
 
 // ---- 4. output safety filter (every force sent goes through this)

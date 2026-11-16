@@ -18,10 +18,23 @@ namespace touch {
 
 using Clock = std::chrono::steady_clock;
 
+// Virtual fixture modes = the paper's three study conditions (Bloom et al., IEEE ToH 2026). Key [c] cycles.
+enum class FixtureMode : int {
+  kOff = 0,        // no fixture: nothing stops the arm (but the floor backstop)
+  kImpedance = 1,  // eq. 9-10: spring on how far the HAND is past the wall; the arm is NOT stopped
+  kCbf = 2,        // eq. 22-23: CBF filter stops the arm before the wall; force = D x speed removed
+};
+inline const char* mode_name(FixtureMode m) {
+  switch (m) {
+    case FixtureMode::kOff: return "OFF";
+    case FixtureMode::kImpedance: return "IMPEDANCE";
+    default: return "CBF";
+  }
+}
+
 struct Config {
   bool enable_force = false;   // false = only zero force is ever sent
-  WorkspaceMap map;            // scale + axis signs (anchors set at runtime)
-  bool tip_control = true;     // stylus drives the tool tip (true) or the wrist point (false)
+  WorkspaceMap map;            // scale + axis signs (anchors set at runtime). The hand drives the wrist point
   double max_joint_speed = 2.0;  // rad/s, rate limit on the arm target
   int stylus_axis = 0;         // column of the Touch rotation matrix along the stylus
   double pitch_gain = 1.0;     // stylus pitch -> tool pitch (0 = hold wrist)
@@ -31,18 +44,23 @@ struct Config {
   double engage_ramp_s = 0.5;
   double free_damping = 0.3;   // N/(m/s) while engaged
   double velocity_lpf_hz = 30.0;  // low-pass on the stylus velocity used by all damping
-  bool wall_enabled = true;    // drawn + stops the arm; force only with enable_force
+
+  // ---- virtual fixture (a plane on the tool tip)
   Wall wall;
-  bool cbf_mode = false;       // start in CBF (true) or proxy (false) mode. Key [c] switches
-  double cbf_alpha = 5.0;      // 1/s: approach speed limit = alpha x distance (arm side). Start value
-  Transient transient;         // vibration "tap" on wall contact (proxy mode)
+  FixtureMode mode = FixtureMode::kImpedance;  // start mode
+  bool filter_always = false;  // [f]: CBF filter on the arm in EVERY mode (the paper's user study)
+  double floor_below = 0.015;  // m: hard floor this far below the wall (the table). The commanded tip never passes it
+  double cbf_gain = 10.0;      // K [1/s]: the arm chases the hand at u = K x gap (eq. 7). Up/Down live
+  double cbf_alpha = 3.33;     // alpha [1/s]: approach at most alpha x height (eq. 14). Left/Right live
+  double cbf_damping = 40.0;   // D [N s/m at the stylus]: CBF force = D x speed removed (eq. 23)
+
+  // ---- other forces
+  bool tracking_enabled = true;      // [h]: eq. 8 "rubber band" from the hand to the robot
+  double tracking_stiffness = 15.0;  // N/m at the stylus (the paper's Kp)
   bool reach_enabled = true;   // spring toward what the arm can reach
   double reach_stiffness = 100.0;
-  bool feedback_enabled = false;  // spring toward the real follower tip
-  double feedback_stiffness = 50.0;
-  double feedback_deadband_m = 0.01;
-  double feedback_lpf_hz = 15.0;
-  double watchdog_s = 0.1;     // older follower states are ignored
+
+  double watchdog_s = 0.1;     // follower states older than this are ignored
   Arm5 home{0.0, -0.8, 0.8, 0.0, 0.0};  // ghost pose until the follower is heard
   std::string description_dir;          // so101_description share dir (meshes for the window)
 };
@@ -68,10 +86,15 @@ struct FromRos {
 struct HapticState {
   std::uint64_t ticks = 0;
   double rate_hz = 0;
-  bool engaged = false, fault = false, follower_live = false, in_wall = false, clamped = false;
-  bool wall_on = false, feedback_on = false, transient_on = false, cbf_on = false;
-  double cbf_gap = 0;          // CBF: how far the hand is ahead of the arm target, toward the wall [m]
-  double cbf_alpha = 0;        // current alpha [1/s]
+  bool engaged = false, fault = false, follower_live = false, clamped = false;
+  FixtureMode mode = FixtureMode::kImpedance;
+  bool filter_on = false;      // CBF filter acting on the arm this tick (CBF mode, or [f])
+  bool tracking_on = false;
+  bool hand_in_wall = false;   // the hand is past the wall (impedance force zone)
+  bool at_floor = false;       // the floor backstop is holding the arm
+  double cbf_removed = 0;      // speed the filter removed toward the wall [m/s, arm side]; > 0 = active
+  double cbf_gain = 0, cbf_alpha = 0;  // live K and alpha [1/s]
+  double f_wall = 0, f_cbf = 0, f_track = 0;  // force components [N], before the safety filter
   Fault fault_reason = Fault::kNone;
   Vec3 force{};              // sent to the Touch (touch frame)
   double pitch = 0, twist = 0;
@@ -85,9 +108,12 @@ struct Shared {
   std::mutex from_ros_mtx, state_mtx;
   FromRos from_ros;
   HapticState state;
-  std::atomic<bool> wall_on{false}, feedback_on{false}, transient_on{false};  // window keys (only when not engaged)
-  std::atomic<bool> cbf_on{false};  // [c]: wall mode, CBF (true) or proxy (false)
-  std::atomic<double> cbf_alpha{5.0};  // [1]-[5]: alpha presets, live (only changes the speed limit: no force step)
+  // window keys. Mode/filter/tracking only while button 1 is released; K and alpha anytime.
+  std::atomic<int> mode{static_cast<int>(FixtureMode::kImpedance)};  // [c]
+  std::atomic<bool> filter_always{false};  // [f]
+  std::atomic<bool> tracking_on{true};     // [h]
+  std::atomic<double> cbf_gain{10.0};      // Up/Down
+  std::atomic<double> cbf_alpha{3.33};     // Left/Right, [1]-[5] = K/alpha presets
 };
 
 }  // namespace touch

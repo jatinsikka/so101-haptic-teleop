@@ -64,7 +64,7 @@ def generate_launch_description():
         DeclareLaunchArgument("move", default_value="false", description="true = the arm may move"),
         DeclareLaunchArgument("enable_force", default_value="false"),
         DeclareLaunchArgument("fast", default_value="false", description="true = reactive profile (overshoots)"),
-        DeclareLaunchArgument("wall_mode", default_value="proxy", description="start mode: proxy or cbf ([c] switches)"),
+        DeclareLaunchArgument("wall_mode", default_value="impedance", description="start mode: off, impedance or cbf ([c] cycles)"),
         DeclareLaunchArgument("p_gain", default_value="", description="servo P override, 0-254"),
         DeclareLaunchArgument("d_gain", default_value="", description="servo D override, 0-254"),
         DeclareLaunchArgument("torque_limit", default_value="", description="override, 0-1000 (= 0-100%)"),
